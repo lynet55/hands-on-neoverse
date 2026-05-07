@@ -1,17 +1,32 @@
 __pycache__
 *.egg-info
+*.npz
 .vscode
 .gradio
 .claude
 pyrightconfig.json
 
+# virtual environments
+neoverse/
+
+# generated outputs
+/logs/
+/runs/
 /models
 /outputs
+
+# data directories
 /diffsynth/data/images/*
 /diffsynth/data/masks/*
 /diffsynth/data/merged_masks/*
 /diffsynth/data/object_models/*
 /diffsynth/data/tar_recv/*
+/diffsynth/data/tar_recv_2/
 /diffsynth/data/training_masks/*
+/diffsynth/data/training_data/*
+/diffsynth/data/training_data_modal/*
+/diffsynth/data/tar_recv_modal_0/
+/diffsynth/data/tar_recv_modal_1/
 /diffsynth/data/training_images/*
 /diffsynth/data/mano/*
+/diffsynth/data/training/logs/

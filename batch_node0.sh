@@ -9,5 +9,5 @@ cd /work/courses/3dv/team32/handy-NeoVerse
 # python diffsynth/data/optimized_download.py --clip-start 801 \
 #   --tar-dir diffsynth/data/tar_recv_1 --num-workers 2 --max-stored-clips 4
 
-python diffsynth/data/optimized_download.py --clip-start 527 --clip-end 862 \
-  --tar-dir diffsynth/data/tar_recv_1 --num-workers 2 --max-stored-clips 4
+python diffsynth/data/optimized_download.py --clip-start 191 --clip-end 526 \
+  --tar-dir diffsynth/data/tar_recv --num-workers 2 --max-stored-clips 4

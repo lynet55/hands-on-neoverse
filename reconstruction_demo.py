@@ -24,6 +24,9 @@ from diffsynth import save_video, save_frames
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt")
+parser.add_argument("--hand_head_path", default="models/NeoVerse/hand_seg_model_opt_best.ckpt",
+                    help="Optional checkpoint with retrained hand_pred_head weights "
+                         "(overrides the hand_pred_head layers from the base reconstructor).")
 parser.add_argument("--low_vram", action="store_true",
                     help="Keep model on CPU; move to GPU only during inference")
 parser.add_argument("--max_frames", type=int, default=81,
@@ -47,6 +50,28 @@ model_manager = ModelManager()
 model_manager.load_model(args.reconstructor_path, device=load_device, torch_dtype=torch.bfloat16)
 reconstructor = model_manager.fetch_model("reconstructor")
 print("Reconstructor loaded.")
+
+if args.hand_head_path is not None:
+    print(f"Overriding hand_pred_head from {args.hand_head_path}...")
+    ckpt = torch.load(args.hand_head_path, map_location="cpu")
+    sd = ckpt.get("model_state_dict", ckpt)
+    
+    # FIX: Check if the keys lack the prefix, and add it if they do
+    if not any(k.startswith("hand_pred_head.") for k in sd.keys()):
+        sd = {f"hand_pred_head.{k}": v for k, v in sd.items()}
+    else:
+        sd = {k: v for k, v in sd.items() if k.startswith("hand_pred_head.")}
+        
+    if not sd:
+        raise RuntimeError(f"No 'hand_pred_head.*' keys found in {args.hand_head_path}")
+        
+    missing, unexpected = reconstructor.load_state_dict(sd, strict=False)
+    unexpected_hand = [k for k in unexpected if k.startswith("hand_pred_head.")]
+    if unexpected_hand:
+        raise RuntimeError(f"Unexpected hand_pred_head keys: {unexpected_hand}")
+        
+    reconstructor.hand_pred_head.to(device=load_device, dtype=torch.bfloat16)
+    print(f"  -> loaded {len(sd)} hand_pred_head tensors.")
 
 
 @torch.no_grad()
@@ -83,8 +108,15 @@ def reconstruct(video_path, scene_type):
     input_c2w = predictions["rendered_extrinsics"][0]   # [S, 4, 4]
     input_intrs = predictions["rendered_intrinsics"][0] # [S, 3, 3]
     input_timestamps = predictions["rendered_timestamps"][0]  # [S]
-    classifications = predictions["seg_labels"][0]
+    classifications = predictions["seg_labels"][0]   # [S, H, W, 4] logits
     print(f"classifications: {type(classifications)}, {classifications.shape}")
+
+    labels = classifications.argmax(dim=-1)           # [S, H, W] class ids in {0,1,2,3}
+    total_counts = torch.bincount(labels.flatten(), minlength=4)
+    print(f"pixels per class (all frames): {total_counts.tolist()}")
+    for s in range(labels.shape[0]):
+        per_frame = torch.bincount(labels[s].flatten(), minlength=4)
+        print(f"  frame {s}: {per_frame.tolist()}  (sum={per_frame.sum().item()})")
     # --- Point cloud GLB ---
     points, colors, frame_indices = extract_point_cloud(predictions)
     scene = build_scene_glb(points, colors, frame_indices, input_c2w.cpu().numpy())
@@ -99,7 +131,7 @@ def reconstruct(video_path, scene_type):
         render_Ks=[input_intrs],
         render_timestamps=[input_timestamps],
         sh_degree=0, width=res_w, height=res_h,
-        render_classes = [0, 1, 0, 1]
+        render_classes = [2]
     )
     # target_rgb: [1, S, H, W, 3] float in [0,1]
     frames = [
@@ -150,7 +182,7 @@ with gr.Blocks(title="NeoVerse — Reconstruction Viewer") as demo:
 if __name__ == "__main__":
     # demo.queue(max_size=3).launch(show_error=True, server_name="0.0.0.0", server_port=7860)
     glb_path, splat_video_path, info = reconstruct(
-        "examples/videos/driving.mp4", "General scene"
+        "examples/videos/hot3d.mp4", "General scene"
     )
     print(info)
     print(f"GLB saved to: {glb_path}")

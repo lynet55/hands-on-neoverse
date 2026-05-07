@@ -57,7 +57,7 @@ class TrainConfig:
     batch_size: int = 4       # smaller than seg head training: full forward + rasterizer is heavier
     epochs: int = 10
     learning_rate: float = 1e-4
-    weight_decay: float = 0.01
+    weight_decay: float = 0.0  # mask-channel-only training; avoid decoupled decay on frozen rows
     grad_clip_norm: float = 1.0
 
     frame_stride: int = 3
@@ -111,18 +111,12 @@ class GsMaskReconstructor:
         self.reconstructor: WorldMirror = model_manager.fetch_model("reconstructor")
         dbg("Reconstructor loaded.")
 
-        # Freeze everything, then unfreeze only gs_renderer.gs_head
+        # Freeze everything. We only train the final mask-logit output rows
+        # of gs_renderer.gs_head / gs_head_dynamic; geometry/color rows stay fixed.
         n_train, n_total = 0, 0
         for name, param in self.reconstructor.named_parameters():
             n_total += 1
-            if "gs_renderer.gs_head" in name or "gs_renderer.gs_head_dynamic" in name:
-                param.requires_grad = True
-                n_train += 1
-            else:
-                param.requires_grad = False
-        dbg(f"Trainable: {n_train}/{n_total} params (gs_head only).")
-        if n_train == 0:
-            raise RuntimeError("No parameters matched 'gs_renderer.gs_head'.")
+            param.requires_grad = False
 
         # The checkpoint's gs_head.2 has shape [12, 256, 1, 1] (no mask channels).
         # load_state_dict(strict=False) silently skips mismatched shapes, which would
@@ -134,13 +128,64 @@ class GsMaskReconstructor:
         self.reconstructor.gs_renderer.gs_head.float()
         if hasattr(self.reconstructor.gs_renderer, "gs_head_dynamic"):
             self.reconstructor.gs_renderer.gs_head_dynamic.float()
-        for p in self.reconstructor.gs_renderer.gs_head.parameters():
-            p.requires_grad = True
+
+        self._grad_hooks = []
+        n_train += self._enable_mask_channel_training(
+            self.reconstructor.gs_renderer.gs_head,
+            "gs_renderer.gs_head",
+        )
         if hasattr(self.reconstructor.gs_renderer, "gs_head_dynamic"):
-            for p in self.reconstructor.gs_renderer.gs_head_dynamic.parameters():
-                p.requires_grad = True
+            n_train += self._enable_mask_channel_training(
+                self.reconstructor.gs_renderer.gs_head_dynamic,
+                "gs_renderer.gs_head_dynamic",
+            )
+        dbg(f"Trainable: {n_train}/{n_total} params (mask-logit rows only).")
+        if n_train == 0:
+            raise RuntimeError("No mask-logit parameters were enabled for training.")
         self.set_train_mode()
         dbg("gs_head cast to float32.")
+
+    def _enable_mask_channel_training(self, head: nn.Module, head_name: str) -> int:
+        """Train only the appended mask-logit rows of the final GS conv.
+
+        The final conv predicts [geometry/color/opacity rows | mask rows]. We keep
+        the pretrained rows frozen by masking their gradients, while the new mask
+        rows learn through the rasterized 2D segmentation loss.
+        """
+        for p in head.parameters():
+            p.requires_grad = False
+
+        final_conv = head[-1]
+        if not isinstance(final_conv, nn.Conv2d):
+            raise TypeError(f"{head_name}[-1] must be nn.Conv2d, got {type(final_conv).__name__}")
+
+        mask_start = final_conv.out_channels - self.cfg.num_classes
+        if mask_start <= 0:
+            raise ValueError(
+                f"{head_name} has {final_conv.out_channels} output channels, "
+                f"cannot reserve {self.cfg.num_classes} mask channels."
+            )
+
+        final_conv.weight.requires_grad = True
+        final_conv.bias.requires_grad = True
+
+        def mask_weight_grad(grad):
+            masked = torch.zeros_like(grad)
+            masked[mask_start:] = grad[mask_start:]
+            return masked
+
+        def mask_bias_grad(grad):
+            masked = torch.zeros_like(grad)
+            masked[mask_start:] = grad[mask_start:]
+            return masked
+
+        self._grad_hooks.append(final_conv.weight.register_hook(mask_weight_grad))
+        self._grad_hooks.append(final_conv.bias.register_hook(mask_bias_grad))
+        dbg(
+            f"  [{head_name}] training output rows {mask_start}:{final_conv.out_channels} "
+            f"as mask logits; rows 0:{mask_start} frozen."
+        )
+        return 2
 
     def _restore_pretrained_gs_head_weights(self, ckpt_path: str, device: str):
         """Copy pre-trained geometry channels into the expanded gs_head final conv.
@@ -194,9 +239,15 @@ class GsMaskReconstructor:
             self.reconstructor.gs_renderer.gs_head_dynamic.eval()
 
     def trainable_parameters(self):
-        params = list(self.reconstructor.gs_renderer.gs_head.parameters())
+        params = [
+            p for p in self.reconstructor.gs_renderer.gs_head.parameters()
+            if p.requires_grad
+        ]
         if hasattr(self.reconstructor.gs_renderer, "gs_head_dynamic"):
-            params += list(self.reconstructor.gs_renderer.gs_head_dynamic.parameters())
+            params += [
+                p for p in self.reconstructor.gs_renderer.gs_head_dynamic.parameters()
+                if p.requires_grad
+            ]
         return params
 
     def forward(self, images: torch.Tensor):
@@ -411,11 +462,15 @@ def load_checkpoint(model, optimizer, cfg, train_loader_len: int):
     if "gs_head_dynamic" in params and hasattr(model.reconstructor.gs_renderer, "gs_head_dynamic"):
         model.reconstructor.gs_renderer.gs_head_dynamic.load_state_dict(params["gs_head_dynamic"], strict=True)
 
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(cfg.device)
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    except ValueError as exc:
+        dbg(f"Optimizer state not compatible with current trainable params; starting optimizer fresh ({exc}).")
+    else:
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(cfg.device)
 
     start_epoch = int(ckpt.get("epoch", -1)) + 1
     global_step = int(ckpt.get("global_step", start_epoch * max(1, train_loader_len)))
@@ -515,6 +570,7 @@ def train():
     trainable = model.trainable_parameters()
     dbg(f"Optimizer: {len(trainable)} trainable tensors")
     optimizer = torch.optim.AdamW(trainable, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    dbg(f"Optimizer weight_decay={cfg.weight_decay} (0 keeps frozen output rows unchanged under AdamW).")
     warmup_steps = 100
     warmup   = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
     decay    = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.80)

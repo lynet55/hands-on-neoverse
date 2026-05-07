@@ -48,6 +48,7 @@ STREAMS = ["stream1201-1", "stream1201-2"]
 
 _WORKER_MANO_MODEL: Optional[MANOHandModel] = None
 _WORKER_HAND_TYPE: Optional[str] = None
+_WORKER_MASK_TYPE: str = "modal"
 
 
 # ---------------------------------------------------------------------------
@@ -58,14 +59,16 @@ def setup_worker(
     log_queue: multiprocessing.Queue,
     hand_type: str,
     mano_model_dir: Optional[str],
+    mask_type: str = "modal",
     log_level: int = logging.INFO,
 ) -> None:
-    global _WORKER_MANO_MODEL, _WORKER_HAND_TYPE
+    global _WORKER_MANO_MODEL, _WORKER_HAND_TYPE, _WORKER_MASK_TYPE
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(QueueHandler(log_queue))
     root.setLevel(log_level)
     _WORKER_HAND_TYPE = hand_type
+    _WORKER_MASK_TYPE = mask_type
     _WORKER_MANO_MODEL = MANOHandModel(mano_model_dir) if hand_type == "mano" and mano_model_dir else None
 
 
@@ -94,6 +97,7 @@ def process_clip(clip_path: str, undistort: bool, output_dir: str) -> str:
     log = logging.getLogger(__name__)
     mano_model = _WORKER_MANO_MODEL
     hand_type = _WORKER_HAND_TYPE
+    mask_type = _WORKER_MASK_TYPE
 
     with open(clip_path, "rb") as f:
         tar_bytes = f.read()
@@ -142,7 +146,7 @@ def process_clip(clip_path: str, undistort: bool, output_dir: str) -> str:
             if objects is not None:
                 for instance_list in objects.values():
                     for instance in instance_list:
-                        mask_rle = instance.get("masks_amodal", {}).get(sk)
+                        mask_rle = instance.get(f"masks_{mask_type}", {}).get(sk)
                         if mask_rle is None:
                             continue
                         mask = clip_util.decode_binary_mask_rle(mask_rle)
@@ -342,6 +346,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-stored-clips", type=int, default=4)
     parser.add_argument("--mano-model-dir", default="./diffsynth/data/mano/models/")
+    parser.add_argument("--mask-type", choices=["modal", "amodal"], default="modal",
+                        help="Object mask type: 'modal' (visible only) or 'amodal' (includes occluded). Default: modal.")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -362,6 +368,7 @@ def main() -> None:
     clips_dir      = args.tar_dir
     mano_model_dir = args.mano_model_dir
     hand_type      = "mano"
+    mask_type      = args.mask_type
     clip_start     = args.clip_start
     clip_end       = args.clip_end
     num_workers    = args.num_workers
@@ -384,6 +391,7 @@ def main() -> None:
 
     range_str = f"{clip_start}–{clip_end if clip_end >= 0 else '∞'}"
     log.info(f"Starting pipeline | clips: {range_str} | tar-dir: {clips_dir} | "
+             f"output-dir: {output_dir} | mask-type: {mask_type} | "
              f"workers: {num_workers} | max-on-disk: {max_stored_clips}")
 
     # Pre-populate done set from output_dir
@@ -409,7 +417,7 @@ def main() -> None:
         with ProcessPoolExecutor(
             max_workers=num_workers,
             initializer=setup_worker,
-            initargs=(log_queue, hand_type, mano_model_dir, log_level),
+            initargs=(log_queue, hand_type, mano_model_dir, mask_type, log_level),
         ) as executor:
             futures: dict = {}
 

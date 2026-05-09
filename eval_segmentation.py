@@ -20,7 +20,6 @@ from torchvision.transforms import functional as F
 
 from diffsynth.models import ModelManager
 from diffsynth import save_video
-from diffsynth.data.training.training_gs_mask import GsMaskReconstructor, TrainConfig
 
 CLASS_NAMES = ["right_hand", "left_hand", "object", "background"]
 # RGBA overlay colors
@@ -89,7 +88,27 @@ def compute_iou(pred: np.ndarray, gt: np.ndarray, n_classes: int = 4):
     return ious
 
 
-def load_hand_head_model(args, device):
+# ---------- main ----------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--npz", nargs="+",
+                        default=["diffsynth/data/training_data/clip-001053.npz"])
+    parser.add_argument("--reconstructor_path",
+                        default="models/NeoVerse/reconstructor.ckpt")
+    parser.add_argument("--hand_head_path",
+                        default="models/NeoVerse/hand_seg_model_opt_run20260426-130617_epoch004.ckpt")
+    parser.add_argument("--output", default="outputs/eval_seg.mp4")
+    parser.add_argument("--stream", default=None,
+                        help="Which stream to use, e.g. 'stream1201-1'. Defaults to first found.")
+    parser.add_argument("--stride", type=int, default=3,
+                        help="Frame stride (matches training default of 3)")
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- load model ----
     print(f"Loading reconstructor ...")
     model_manager = ModelManager()
     model_manager.load_model(args.reconstructor_path, device="cpu",
@@ -104,95 +123,15 @@ def load_hand_head_model(args, device):
     else:
         sd = {k: v for k, v in sd.items() if k.startswith("hand_pred_head.")}
     reconstructor.load_state_dict(sd, strict=False)
+    # Keep head in float32 — critical for correct gradients
     reconstructor.hand_pred_head.float()
     reconstructor.to(device).eval()
-    return reconstructor
-
-
-def load_gs_mask_model(args, device):
-    print(f"Loading GS mask model from {args.gs_mask_path} ...")
-    cfg = TrainConfig(
-        device=device,
-        reconstruction_model_path=args.reconstructor_path,
-        resume_from=None,
-    )
-    model = GsMaskReconstructor(cfg)
-    ckpt = torch.load(args.gs_mask_path, map_location=device, weights_only=False)
-    sd = ckpt["model_state_dict"]
-    model.reconstructor.gs_renderer.gs_head.load_state_dict(sd["gs_head"], strict=True)
-    if "gs_head_dynamic" in sd and hasattr(model.reconstructor.gs_renderer, "gs_head_dynamic"):
-        model.reconstructor.gs_renderer.gs_head_dynamic.load_state_dict(sd["gs_head_dynamic"], strict=True)
-    model.set_eval_mode()
-    return model
-
-
-@torch.no_grad()
-def predict_hand_head(reconstructor, imgs_tensor, device):
-    S = imgs_tensor.shape[0]
-    views = {
-        "img":       imgs_tensor.unsqueeze(0).to(device),
-        "is_target": torch.zeros((1, S), dtype=torch.bool, device=device),
-        "is_static": torch.zeros((1, S), dtype=torch.bool, device=device),
-        "timestamp": torch.arange(S, dtype=torch.int64, device=device).unsqueeze(0),
-    }
-
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
-        predictions = reconstructor(views, is_inference=True, use_motion=False)
-    seg_logits = predictions["seg_labels"][0]          # (S, H, W, 4)
-    return seg_logits.float().argmax(dim=-1).cpu().numpy()
-
-
-@torch.no_grad()
-def predict_gs_mask(model, imgs_tensor, device, batch_size):
-    pred_chunks = []
-    for start in range(0, imgs_tensor.shape[0], batch_size):
-        chunk = imgs_tensor[start:start + batch_size]
-        logits = model.forward(chunk)                  # (B, 4, H, W)
-        pred_chunks.append(logits.float().argmax(dim=1).cpu().numpy())
-    return np.concatenate(pred_chunks, axis=0)
-
-
-# ---------- main ----------
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--npz", nargs="+",
-                        default=["diffsynth/data/training_data/clip-001053.npz"])
-    parser.add_argument("--reconstructor_path",
-                        default="models/NeoVerse/reconstructor.ckpt")
-    parser.add_argument("--hand_head_path",
-                        default="models/NeoVerse/hand_seg_model_opt_run20260426-130617_epoch004.ckpt")
-    parser.add_argument("--gs_mask_path", default=None,
-                        help="Evaluate a rendered-GS-mask checkpoint instead of hand_pred_head.")
-    parser.add_argument("--output", default="outputs/eval_seg.mp4")
-    parser.add_argument("--stream", default=None,
-                        help="Which stream to use, e.g. 'stream1201-1'. Defaults to first found.")
-    parser.add_argument("--stride", type=int, default=3,
-                        help="Frame stride (matches training default of 3)")
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="Batch size for GS-mask evaluation.")
-    args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-
-    # ---- load model ----
-    if args.gs_mask_path:
-        model = load_gs_mask_model(args, device)
-        eval_mode = "gs_mask"
-    else:
-        model = load_hand_head_model(args, device)
-        eval_mode = "hand_head"
 
     all_clip_ious = []
 
     for npz_path in args.npz:
         clip_name = Path(npz_path).stem
-        output_arg = Path(args.output)
-        if len(args.npz) == 1:
-            out_path = output_arg
-        else:
-            out_path = output_arg.parent / f"{output_arg.stem}_{clip_name}{output_arg.suffix}"
+        out_path = Path(args.output).parent / f"eval_seg_{clip_name}.mp4"
         print(f"\n{'='*50}")
         print(f"Clip: {clip_name}")
 
@@ -212,11 +151,20 @@ def main():
             for i in frame_indices
         ], dim=0)                                  # (S, 3, H, W)
 
-        if eval_mode == "gs_mask":
-            pred_labels = predict_gs_mask(model, imgs_tensor, device, args.batch_size)
-        else:
-            pred_labels = predict_hand_head(model, imgs_tensor, device)
-        S = pred_labels.shape[0]
+        S = imgs_tensor.shape[0]
+        views = {
+            "img":       imgs_tensor.unsqueeze(0).to(device),
+            "is_target": torch.zeros((1, S), dtype=torch.bool, device=device),
+            "is_static": torch.zeros((1, S), dtype=torch.bool, device=device),
+            "timestamp": torch.arange(S, dtype=torch.int64, device=device).unsqueeze(0),
+        }
+
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
+                predictions = reconstructor(views, is_inference=True, use_motion=False)
+
+        seg_logits = predictions["seg_labels"][0]          # (S, H, W, 4)
+        pred_labels = seg_logits.float().argmax(dim=-1).cpu().numpy()
 
         # ---- GT labels ----
         gt_labels = np.stack([build_gt_label(npz, stream, i) for i in frame_indices])
@@ -254,7 +202,7 @@ def main():
         save_video(out_frames, str(out_path), fps=10)
         print(f"  Saved {out_path}")
 
-        del imgs_tensor
+        del predictions, views, imgs_tensor
         torch.cuda.empty_cache()
 
     # ---- overall summary ----

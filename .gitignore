@@ -7,11 +7,19 @@ pyrightconfig.json
 
 /models
 /outputs
+/logs
+/runs
+/neoverse
 /diffsynth/data/images/*
 /diffsynth/data/masks/*
 /diffsynth/data/merged_masks/*
 /diffsynth/data/object_models/*
 /diffsynth/data/tar_recv/*
+/diffsynth/data/tar_recv_*
 /diffsynth/data/training_masks/*
 /diffsynth/data/training_images/*
+/diffsynth/data/training_data/*
+/diffsynth/data/training_data_*
+/diffsynth/data/training/logs/*
 /diffsynth/data/mano/*
+/examples/videos/*

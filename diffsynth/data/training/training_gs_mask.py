@@ -59,6 +59,9 @@ class TrainConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
+    rgb_loss_weight: float = 0.1
+    depth_loss_weight: float = 0.05
+    depth_loss_eps: float = 1e-4
 
     frame_stride: int = 3
     val_fraction: float = 0.1
@@ -67,6 +70,7 @@ class TrainConfig:
 
     reconstruction_model_path: str = "models/NeoVerse/reconstructor.ckpt"
     save_model_path_prefix: str = "models/NeoVerse/gs_mask_model"
+    data_root: str = "diffsynth/data/training_data_modal"
 
     resume_from: str = "latest"
 
@@ -206,7 +210,8 @@ class GsMaskReconstructor:
             images: [B, 3, H, W] — a batch of single frames.
 
         Returns:
-            rendered_masks: [B, num_classes, H, W] rendered class logits.
+            dict with rendered mask logits, RGB, depth, alpha, and frozen
+            gs_depth pseudo-targets.
         """
         B, C, H, W = images.shape
         # Treat each image in the batch as a 1-frame sequence
@@ -228,11 +233,23 @@ class GsMaskReconstructor:
         input_intrs = predictions["rendered_intrinsics"] # [B, 1, 3, 3]
         input_timestamps = predictions["rendered_timestamps"]  # [B, 1]
 
-        # Rasterize per-batch: collect rendered masks [B, 1, H, W, C]
+        target_depth = predictions["gs_depth"][:, 0].detach()
+        if target_depth.ndim == 4 and target_depth.shape[-1] == 1:
+            target_depth = target_depth.permute(0, 3, 1, 2)  # [B, H, W, 1] -> [B, 1, H, W]
+        elif target_depth.ndim == 3:
+            target_depth = target_depth.unsqueeze(1)          # [B, H, W] -> [B, 1, H, W]
+        elif target_depth.ndim != 4 or target_depth.shape[1] != 1:
+            raise RuntimeError(f"Unexpected gs_depth shape: {tuple(predictions['gs_depth'].shape)}")
+        target_depth = target_depth.float()
+
+        # Rasterize per-batch: collect rendered outputs [B, 1, H, W, C]
         batch_masks = []
+        batch_rgbs = []
+        batch_depths = []
+        batch_alphas = []
         for b in range(B):
             w2c_b = homo_matrix_inverse(input_c2w[b])   # [1, 4, 4]
-            _, _, _, rendered_masks = self.reconstructor.gs_renderer.rasterizer.forward(
+            rendered_rgb, rendered_depth, rendered_alpha, rendered_masks = self.reconstructor.gs_renderer.rasterizer.forward(
                 render_splats=[gaussians[b]],
                 render_viewmats=[w2c_b],
                 render_Ks=[input_intrs[b]],
@@ -248,12 +265,29 @@ class GsMaskReconstructor:
                 )
             if rendered_masks.ndim == 5 and rendered_masks.shape[0] == 1:
                 rendered_masks = rendered_masks.squeeze(0)
+                rendered_rgb = rendered_rgb.squeeze(0)
+                rendered_depth = rendered_depth.squeeze(0)
+                rendered_alpha = rendered_alpha.squeeze(0)
+            batch_rgbs.append(rendered_rgb)      # [1, H, W, 3]
+            batch_depths.append(rendered_depth)  # [1, H, W, 1]
+            batch_alphas.append(rendered_alpha)  # [1, H, W, 1]
             batch_masks.append(rendered_masks)  # [1, H, W, C]
 
-        # [B, H, W, C] → [B, C, H, W] for loss
+        # [B, H, W, C] -> [B, C, H, W] for loss
         rendered_masks = torch.cat(batch_masks, dim=0)          # [B, H, W, C]
         rendered_masks = rendered_masks.permute(0, 3, 1, 2)     # [B, C, H, W]
-        return rendered_masks
+        rendered_rgb = torch.cat(batch_rgbs, dim=0).permute(0, 3, 1, 2).float()
+        rendered_depth = torch.cat(batch_depths, dim=0).permute(0, 3, 1, 2).float()
+        rendered_alpha = torch.cat(batch_alphas, dim=0).permute(0, 3, 1, 2).float()
+
+        return {
+            "mask_logits": rendered_masks,
+            "rgb": rendered_rgb,
+            "depth": rendered_depth,
+            "alpha": rendered_alpha,
+            "target_rgb": images.to(cfg.device, non_blocking=True).float(),
+            "target_depth": target_depth,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +346,52 @@ class DiceLoss:
             present_count += present
         per_sample = score_sum / present_count.clamp(min=1.0)
         return 1.0 - per_sample.mean()
+
+
+def masked_mean(values: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return (values * weights).sum() / weights.sum().clamp_min(eps)
+
+
+def reconstruction_losses(outputs, cfg: TrainConfig):
+    """RGB/depth anchors for full-Gaussian training.
+
+    Mask supervision updates all 16 Gaussian channels, including geometry,
+    opacity, and color. These terms keep the rendered Gaussians close to the
+    original pretrained reconstruction while the new mask logits learn.
+    """
+    rendered_rgb = outputs["rgb"]
+    target_rgb = outputs["target_rgb"]
+    rendered_depth = outputs["depth"]
+    target_depth = outputs["target_depth"]
+    alpha = outputs["alpha"].detach().clamp(0.0, 1.0)
+
+    if target_rgb.shape[-2:] != rendered_rgb.shape[-2:]:
+        target_rgb = F.interpolate(target_rgb, size=rendered_rgb.shape[-2:], mode="bilinear", align_corners=False)
+    if target_depth.shape[-2:] != rendered_depth.shape[-2:]:
+        target_depth = F.interpolate(target_depth, size=rendered_depth.shape[-2:], mode="nearest")
+
+    rgb_loss = masked_mean((rendered_rgb - target_rgb).abs(), alpha.expand_as(rendered_rgb))
+
+    depth_valid = torch.isfinite(target_depth) & torch.isfinite(rendered_depth) & (target_depth > cfg.depth_loss_eps)
+    depth_weight = alpha * depth_valid.float()
+    rendered_log_depth = torch.log(rendered_depth.clamp_min(cfg.depth_loss_eps))
+    target_log_depth = torch.log(target_depth.clamp_min(cfg.depth_loss_eps))
+    depth_loss = masked_mean(F.smooth_l1_loss(rendered_log_depth, target_log_depth, reduction="none"), depth_weight)
+
+    return rgb_loss, depth_loss
+
+
+def compute_losses(outputs, gt_mask, criterion, dice_loss_fn, cfg: TrainConfig):
+    rendered = outputs["mask_logits"]
+    if rendered.shape[-2:] != gt_mask.shape[-2:]:
+        gt_mask = F.interpolate(gt_mask, size=rendered.shape[-2:], mode="nearest")
+
+    gt_cls = gt_mask.argmax(dim=1).long()
+    ce = criterion(rendered, gt_cls)
+    dl = dice_loss_fn(rendered, gt_mask)
+    rgb_loss, depth_loss = reconstruction_losses(outputs, cfg)
+    loss = ce + dl + cfg.rgb_loss_weight * rgb_loss + cfg.depth_loss_weight * depth_loss
+    return loss, ce, dl, rgb_loss, depth_loss, rendered, gt_mask
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +512,10 @@ def load_checkpoint(model, optimizer, cfg, train_loader_len: int):
 def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
     model.set_eval_mode()
     total_loss = 0.0
+    total_ce = 0.0
+    total_dice = 0.0
+    total_rgb = 0.0
+    total_depth = 0.0
     total_miou = 0.0
     n_steps = 0
     per_class_iou = torch.zeros(cfg.num_classes, device=cfg.device)
@@ -441,15 +525,11 @@ def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
 
     for batch in val_loader:
         images, gt_mask, _, _ = batch
-        rendered = model.forward(images)  # [B, C, H, W] logits
         gt_mask = gt_mask.to(cfg.device, non_blocking=True)
-        if rendered.shape[-2:] != gt_mask.shape[-2:]:
-            gt_mask = F.interpolate(gt_mask, size=rendered.shape[-2:], mode="nearest")
-
-        gt_cls = gt_mask.argmax(dim=1).long()
-        ce = criterion(rendered, gt_cls)
-        dl = dice_loss_fn(rendered, gt_mask)
-        loss = ce + dl
+        outputs = model.forward(images)
+        loss, ce, dl, rgb_loss, depth_loss, rendered, gt_mask = compute_losses(
+            outputs, gt_mask, criterion, dice_loss_fn, cfg
+        )
 
         miou, pc_iou = compute_miou(rendered, gt_mask, cfg.num_classes)
         pc_acc = compute_per_class_accuracy(rendered, gt_mask, cfg.num_classes)
@@ -460,6 +540,10 @@ def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
         confusion += torch.bincount(idx, minlength=K * K).reshape(K, K)
 
         total_loss += loss.item()
+        total_ce += ce.item()
+        total_dice += dl.item()
+        total_rgb += rgb_loss.item()
+        total_depth += depth_loss.item()
         total_miou += miou
         per_class_iou += pc_iou
         per_class_acc += pc_acc
@@ -467,9 +551,13 @@ def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
 
     model.set_train_mode()
     if n_steps == 0:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None
     return (
         total_loss / n_steps,
+        total_ce / n_steps,
+        total_dice / n_steps,
+        total_rgb / n_steps,
+        total_depth / n_steps,
         total_miou / n_steps,
         per_class_iou / n_steps,
         per_class_acc / n_steps,
@@ -490,14 +578,14 @@ def train():
     model.set_train_mode()
 
     # Dataset split
-    all_clips = sorted(p.stem for p in Path("diffsynth/data/training_data").glob("clip-*.npz"))
+    all_clips = sorted(p.stem for p in Path(cfg.data_root).glob("clip-*.npz"))
     n_val = max(1, int(len(all_clips) * cfg.val_fraction))
     val_clips = set(all_clips[-n_val:])
     train_clips = set(all_clips[:-n_val])
     dbg(f"Clips: {len(all_clips)} total → {len(train_clips)} train / {len(val_clips)} val")
 
-    train_ds = StridedHandObjectDataset("diffsynth/data/training_data", cfg.frame_stride, clip_names=train_clips)
-    val_ds   = StridedHandObjectDataset("diffsynth/data/training_data", cfg.frame_stride, clip_names=val_clips)
+    train_ds = StridedHandObjectDataset(cfg.data_root, cfg.frame_stride, clip_names=train_clips)
+    val_ds   = StridedHandObjectDataset(cfg.data_root, cfg.frame_stride, clip_names=val_clips)
     dbg(f"Samples: {len(train_ds)} train / {len(val_ds)} val")
 
     train_loader = DataLoader(train_ds, sampler=ClipStreamSampler(train_ds, shuffle_clips=True),
@@ -510,6 +598,7 @@ def train():
     criterion = nn.CrossEntropyLoss(weight=cfg.class_weights.to(cfg.device), label_smoothing=0.0)
     dice_loss_fn = DiceLoss()
     dbg(f"class weights (bg=1): {cfg.class_weights.tolist()}")
+    dbg(f"loss weights: rgb={cfg.rgb_loss_weight} depth={cfg.depth_loss_weight}")
 
     # Optimizer + schedulers
     trainable = model.trainable_parameters()
@@ -548,6 +637,10 @@ def train():
     for epoch in range(start_epoch, cfg.epochs):
         dbg(f"=== Epoch {epoch+1}/{cfg.epochs} ===")
         epoch_loss = 0.0
+        epoch_ce = 0.0
+        epoch_dice = 0.0
+        epoch_rgb = 0.0
+        epoch_depth = 0.0
         epoch_miou = 0.0
         epoch_per_class_iou = torch.zeros(cfg.num_classes, device=cfg.device)
         epoch_per_class_acc = torch.zeros(cfg.num_classes, device=cfg.device)
@@ -572,10 +665,10 @@ def train():
             gt_mask = gt_mask.to(cfg.device, non_blocking=True)
 
             t_fwd = time.time()
-            rendered = model.forward(images)  # [B, C, H, W] logits
-
-            if rendered.shape[-2:] != gt_mask.shape[-2:]:
-                gt_mask = F.interpolate(gt_mask, size=rendered.shape[-2:], mode="nearest")
+            outputs = model.forward(images)
+            loss, ce, dl, rgb_loss, depth_loss, rendered, gt_mask = compute_losses(
+                outputs, gt_mask, criterion, dice_loss_fn, cfg
+            )
 
             # First-step sanity diagnostics
             if step == 0 and epoch == start_epoch:
@@ -585,14 +678,14 @@ def train():
                     dbg(f"rendered stats: min={rendered.min().item():.3f} "
                         f"max={rendered.max().item():.3f} "
                         f"mean={rendered.mean().item():.3f}")
+                    dbg(f"rgb/depth sanity: rgb={tuple(outputs['rgb'].shape)} "
+                        f"depth={tuple(outputs['depth'].shape)} "
+                        f"alpha_mean={outputs['alpha'].mean().item():.3f} "
+                        f"target_depth=({outputs['target_depth'].min().item():.3f}, "
+                        f"{outputs['target_depth'].max().item():.3f})")
                     pred_counts = {name: (rendered.argmax(dim=1) == i).sum().item()
                                    for i, name in enumerate(class_names)}
                     dbg(f"pred class pixel counts: {pred_counts}")
-
-            gt_cls = gt_mask.argmax(dim=1).long()
-            ce = criterion(rendered, gt_cls)
-            dl = dice_loss_fn(rendered, gt_mask)
-            loss = ce + dl
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
@@ -603,6 +696,10 @@ def train():
             loss_val = loss.item()
             step_time = time.time() - t_fwd
             epoch_loss += loss_val
+            epoch_ce += ce.item()
+            epoch_dice += dl.item()
+            epoch_rgb += rgb_loss.item()
+            epoch_depth += depth_loss.item()
             global_step += 1
 
             miou, per_class_iou = compute_miou(rendered.detach(), gt_mask, cfg.num_classes)
@@ -615,6 +712,8 @@ def train():
             writer.add_scalar("train/loss_step", loss_val, global_step)
             writer.add_scalar("train/ce_step", ce.item(), global_step)
             writer.add_scalar("train/dice_step", dl.item(), global_step)
+            writer.add_scalar("train/rgb_step", rgb_loss.item(), global_step)
+            writer.add_scalar("train/depth_step", depth_loss.item(), global_step)
             writer.add_scalar("train/mIoU_step", miou, global_step)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
             writer.add_scalar("train/step_time", step_time, global_step)
@@ -633,7 +732,8 @@ def train():
                 pc_acc = [f"{n}={per_class_acc[i].item():.2f}" for i, n in enumerate(class_names)]
                 dbg(
                     f"  step {step}: loss={loss_val:.3f} "
-                    f"(ce={ce.item():.3f} dice={dl.item():.3f}) "
+                    f"(ce={ce.item():.3f} dice={dl.item():.3f} "
+                    f"rgb={rgb_loss.item():.3f} depth={depth_loss.item():.3f}) "
                     f"mIoU={miou:.4f} | avg(20) loss={avg_loss_w:.3f} mIoU={avg_miou_w:.4f} "
                     f"IoU[{' '.join(pc_iou)}] Acc[{' '.join(pc_acc)}] "
                     f"lr={optimizer.param_groups[0]['lr']:.2e} "
@@ -649,18 +749,26 @@ def train():
 
         n_steps = step + 1
         avg_loss = epoch_loss / n_steps
+        avg_ce = epoch_ce / n_steps
+        avg_dice = epoch_dice / n_steps
+        avg_rgb = epoch_rgb / n_steps
+        avg_depth = epoch_depth / n_steps
         avg_miou = epoch_miou / n_steps
         epoch_per_class_iou /= n_steps
         epoch_per_class_acc /= n_steps
         elapsed = time.time() - t_epoch
 
         # Validation
-        val_loss, val_miou, val_per_class_iou, val_per_class_acc, val_confusion = evaluate(
+        val_loss, val_ce, val_dice, val_rgb, val_depth, val_miou, val_per_class_iou, val_per_class_acc, val_confusion = evaluate(
             model, val_loader, criterion, dice_loss_fn, cfg, class_names
         )
 
         # TensorBoard — per epoch (train)
         writer.add_scalar("train/loss_epoch", avg_loss, epoch)
+        writer.add_scalar("train/ce_epoch", avg_ce, epoch)
+        writer.add_scalar("train/dice_epoch", avg_dice, epoch)
+        writer.add_scalar("train/rgb_epoch", avg_rgb, epoch)
+        writer.add_scalar("train/depth_epoch", avg_depth, epoch)
         writer.add_scalar("train/mIoU_epoch", avg_miou, epoch)
         writer.add_scalar("train/epoch_time_s", elapsed, epoch)
         for c, name in enumerate(class_names):
@@ -670,6 +778,10 @@ def train():
         # TensorBoard — per epoch (val)
         if val_loss is not None:
             writer.add_scalar("val/loss_epoch", val_loss, epoch)
+            writer.add_scalar("val/ce_epoch", val_ce, epoch)
+            writer.add_scalar("val/dice_epoch", val_dice, epoch)
+            writer.add_scalar("val/rgb_epoch", val_rgb, epoch)
+            writer.add_scalar("val/depth_epoch", val_depth, epoch)
             writer.add_scalar("val/mIoU_epoch", val_miou, epoch)
             for c, name in enumerate(class_names):
                 writer.add_scalar(f"val/IoU_{name}", val_per_class_iou[c].item(), epoch)
@@ -677,9 +789,12 @@ def train():
 
         writer.flush()
 
-        val_str = (f"val_loss={val_loss:.4f} val_mIoU={val_miou:.4f}"
+        val_str = (f"val_loss={val_loss:.4f} val_mIoU={val_miou:.4f} "
+                   f"val_rgb={val_rgb:.4f} val_depth={val_depth:.4f}"
                    if val_loss is not None else "val=n/a")
-        dbg(f"Epoch {epoch+1}/{cfg.epochs}  loss={avg_loss:.4f}  mIoU={avg_miou:.4f}  "
+        dbg(f"Epoch {epoch+1}/{cfg.epochs}  loss={avg_loss:.4f}  "
+            f"ce={avg_ce:.4f} dice={avg_dice:.4f} rgb={avg_rgb:.4f} depth={avg_depth:.4f} "
+            f"mIoU={avg_miou:.4f}  "
             f"{val_str}  ({elapsed:.0f}s)")
 
         if val_confusion is not None:

@@ -304,7 +304,7 @@ class BenchmarkEvaluator:
                 sh_degree=0,
                 width=self.res_w,
                 height=self.res_h,
-                render_classes=[0, 1, 0, 1],
+                render_classes=[0, 0, 0, 0]
             )
             # target_rgb: [1, S, H, W, 3] in [0, 1]
             pred_rgb = target_rgb[0].permute(0, 3, 1, 2).clamp(0, 1).float()
@@ -431,7 +431,7 @@ class BenchmarkEvaluator:
 def parse_args():
     p = argparse.ArgumentParser(description="NeoVerse reconstructor benchmark.")
 
-    p.add_argument("--data-root", type=str, default="diffsynth/data/training_data",
+    p.add_argument("--data-root", type=str, default="diffsynth/data/training_data_modal",
                    help="Must match training_25_04.py to keep the val split consistent.")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--frame-stride", type=int, default=3)

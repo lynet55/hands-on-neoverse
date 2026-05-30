@@ -1,14 +1,11 @@
 #!/bin/bash
 #SBATCH --account=3dv
-#SBATCH --job-name=neoverse_train
+#SBATCH --job-name=benchmark
 #SBATCH --partition=jobs
 #SBATCH --time=7-00:00:00      # 7 days (max allowed)
-#SBATCH --chdir=/work/courses/3dv/team32/handy-NeoVerse
-#SBATCH --output=/work/courses/3dv/team32/handy-NeoVerse/diffsynth/data/benchmarking/logs/%x_%j.out
-#SBATCH --error=/work/courses/3dv/team32/handy-NeoVerse//diffsynth/data/benchmarking/logs/%x_%j.err
-
-# Make sure the log dir exists (sbatch won't create it for you)
-# mkdir -p /work/courses/3dv/team32/handy-NeoVerse/diffsynth/data/benchmarking/logs
+#SBATCH --chdir=/work/courses/3dv/team32/hands-on-neoverse
+#SBATCH --output=/work/courses/3dv/team32/hands-on-neoverse/logs/benchmark_logs/%x_%j.out
+#SBATCH --error=/work/courses/3dv/team32/hands-on-neoverse/logs/benchmark_logs/%x_%j.err
 
 # ---------- Modules ----------
 . /etc/profile.d/modules.sh
@@ -44,14 +41,14 @@ START=$(date +%s)
 python -u -m diffsynth.data.benchmarking.benchmark \
     --reconstruction-model-path models/NeoVerse/reconstructor.ckpt \
     --hand-head-path models/NeoVerse/hand_seg_model_opt_run20260507-224244_epoch005.ckpt \
-    --data-root diffsynth/data/training_data_modal \
+    --data-root /work/courses/3dv/team32/training_data_modal \
     --val-fraction 0.1 \
     --frame-stride 3 \
     --window-size 6 \
     --img-shape 280 280 \
     --num-classes 4 \
     --num-workers 2 \
-    --output-dir outputs/benchmark \
+    --output-dir runs/benchmarks \
     --run-seg \
     --run-render
 EXIT_CODE=$?

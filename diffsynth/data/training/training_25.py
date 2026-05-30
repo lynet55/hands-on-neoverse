@@ -76,7 +76,7 @@ class TrainConfig:
     # save_step_checkpoint. If None, train from scratch. If the literal
     # string "latest", auto-resolves to <prefix>_latest.ckpt. If "best",
     # resolves to <prefix>_best.ckpt.
-    resume_from: str = "latest"
+    resume_from: str = None
 
     # Run id: shared between log_dir and per-epoch checkpoint filenames so
     # the TensorBoard run and its checkpoints can be cross-referenced. Two
@@ -507,19 +507,19 @@ def train():
 
     # ---- dataset split (clip-level 90/10) ----
     t0 = time.time()
-    all_clip_names = sorted(p.stem for p in Path("diffsynth/data/training_data").glob("clip-*.npz"))
+    all_clip_names = sorted(p.stem for p in Path("/work/courses/3dv/team32/training_data_modal").glob("clip-*.npz"))
     n_val = max(1, int(len(all_clip_names) * cfg.val_fraction))
     val_clip_names = set(all_clip_names[-n_val:])
     train_clip_names = set(all_clip_names[:-n_val])
     dbg(f"Clips: {len(all_clip_names)} total → {len(train_clip_names)} train / {len(val_clip_names)} val")
 
     train_dataset = StridedHandObjectDataset(
-        data_root="diffsynth/data/training_data",
+        data_root="/work/courses/3dv/team32/training_data_modal",
         frame_stride=cfg.frame_stride,
         clip_names=train_clip_names,
     )
     val_dataset = StridedHandObjectDataset(
-        data_root="diffsynth/data/training_data",
+        data_root="/work/courses/3dv/team32/training_data_modal",
         frame_stride=cfg.frame_stride,
         clip_names=val_clip_names,
     )

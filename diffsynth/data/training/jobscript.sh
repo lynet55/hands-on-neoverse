@@ -3,12 +3,12 @@
 #SBATCH --job-name=neoverse_train
 #SBATCH --partition=jobs
 #SBATCH --time=2-06:00:00
-#SBATCH --chdir=/work/courses/3dv/team32/handy-NeoVerse
-#SBATCH --output=/work/courses/3dv/team32/handy-NeoVerse/diffsynth/data/training/logs/classificationDPT/%x_%j.out
-#SBATCH --error=/work/courses/3dv/team32/handy-NeoVerse/diffsynth/data/training/logs/classificationDPT/%x_%j.err
+#SBATCH --chdir=/work/courses/3dv/team32/hands-on-neoverse
+#SBATCH --output=/work/courses/3dv/team32/hands-on-neoverse/logs/classificationDPT_%j.out
+#SBATCH --error=/work/courses/3dv/team32/hands-on-neoverse/logs/classificationDPT_%j.err
 
 # Make sure the log dir exists (sbatch won't create it for you)
-mkdir -p /work/courses/3dv/team32/handy-NeoVerse/diffsynth/data/training/logs/classificationDPT
+mkdir -p /work/courses/3dv/team32/hands-on-neoverse/logs/
 
 
 # ---------- Modules ----------

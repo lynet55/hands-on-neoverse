@@ -583,9 +583,14 @@ class GaussianSplatRenderer(nn.Module):
             )
         else:
             gs_params = gs_params_static
-
+        use_gt_geometry = (
+            self.training
+            and "camera_poses" in views
+            and "valid_mask" in views
+            and "depthmap" in views
+        )
         # 2) Select rendering cameras
-        if self.training:
+        if use_gt_geometry:
             # Using all gt cameras
             render_viewmats, render_Ks = self.prepare_cameras(views, S + V)
             gt_valid_masks_src = views["valid_mask"][:, :S]      # [B, S, H, W]

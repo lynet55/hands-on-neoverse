@@ -175,7 +175,7 @@ def train():
     cfg = TrainConfig()
     worldmirror = NeoVerseReconstructor(cfg)
 
-    train_dataset = HandObjectSegmentationDataset(data_root='diffsynth/data/training_data')
+    train_dataset = HandObjectSegmentationDataset(data_root='/work/courses/3dv/team32/hands-on-neoverse/training_data_modal')
     train_sampler = ClipStreamSampler(train_dataset, shuffle_clips=True)
     train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=cfg.batch_size, num_workers=4)
 

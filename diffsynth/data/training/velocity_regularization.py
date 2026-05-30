@@ -1,13 +1,31 @@
-"""Regularize velocity predictions for background pixels.
+"""Velocity regularization for background Gaussians in WorldMirror.
 
-This script trains only the forward/backward velocity heads in the WorldMirror
-reconstructor. It uses the model's own segmentation prediction to decide where
-background is predicted (class 3) and applies an L2 penalty to the predicted
-forward/backward velocities at those pixels. Classes 0-2 do not contribute to
-this regularization loss.
+Goal
+----
+We want background Gaussians (those whose predicted segmentation class is 3)
+to have near-zero velocity, while leaving hand/object Gaussians free to move.
+The hand-segmentation head already knows where background is; this training
+loop uses that signal to regularise the 4DGS velocity field.
 
-The training loop is intentionally lightweight: the backbone and classification
-head are frozen, and only velocity head parameters are updated.
+Since we only have raw input video (no GT depth, cameras, or optical flow),
+we use the frozen pretrained model as a teacher for everything except the RGB
+reconstruction loss.  The teacher provides stable pseudo-GT that prevents
+catastrophic forgetting while the backbone is partially unfrozen.
+
+Loss summary
+------------
+  Lrgb          -- L2 + LPIPS vs. input frames  (true GT)
+  Lregular      -- alpha coverage penalty        (self-supervised)
+  Lbg_vel       -- L2 norm of background Gaussian velocities  (core goal)
+  Lpreserve_fg  -- keep foreground pixel-velocity close to teacher
+  Lcamera       -- student camera params ≈ teacher  (distillation)
+  Ldepth        -- student depth ≈ teacher           (distillation)
+  Lseg          -- student seg logits ≈ teacher      (distillation)
+
+Lmotion (NeoVerse paper) is intentionally omitted: it requires GT velocity
+fields from dynamic-scene datasets that are not available here, and applying
+it naively from teacher predictions would contradict the background-velocity
+goal.
 """
 
 import copy
@@ -25,49 +43,73 @@ from torch.utils.tensorboard import SummaryWriter
 
 from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
 from diffsynth.models.model_manager import ModelManager
+from diffsynth.utils.auxiliary import homo_matrix_inverse
 from diffsynth.data.SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset
 
+try:
+    import lpips as lpips_lib
+except ImportError:
+    lpips_lib = None
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 class SequenceHandObjectDataset(HandObjectSegmentationDataset):
-    """Dataset that returns fixed-length sequences of consecutive frames."""
+    """Returns fixed-length sequences of consecutive frames.
+
+    Each sample is a tuple (images, masks) where
+      images : Float[T, 3, H, W]  in [0, 1]
+      masks  : Float[T, 4, H, W]  one-hot channels: right, left, obj, background
+    """
 
     def __init__(
         self,
-        data_root: str = "diffsynth/data/training_data",
-        num_frames: int = 2,
+        data_root: str = "diffsynth/data/training_data_modal",
+        num_key_frames: int = 4,
         frame_stride: int = 1,
+        random_reverse: bool = True,
         streams=None,
         clip_names=None,
     ):
-        self.num_frames = num_frames
+        self.num_key_frames = num_key_frames
+        self.num_frames = 2 * num_key_frames - 1
         self.frame_stride = frame_stride
+        self.random_reverse = random_reverse
         self._clip_names_filter = set(clip_names) if clip_names is not None else None
         super().__init__(data_root=data_root, streams=streams)
 
     def _build_index(self) -> None:
         self.samples = []
-        for npz_path in sorted(Path(self.data_root).glob("clip-*.npz")):
+        data_root_path = Path(self.data_root)
+        if not data_root_path.exists():
+            raise FileNotFoundError(
+                f"data_root does not exist: {data_root_path}. "
+                f"Expected clip-*.npz files under this directory."
+            )
+        for npz_path in sorted(data_root_path.glob("clip-*.npz")):
             clip_name = npz_path.stem
             if self._clip_names_filter is not None and clip_name not in self._clip_names_filter:
                 continue
             npz = np.load(str(npz_path), mmap_mode="r")
-            n_frames = next(
-                npz[k].shape[0] for k in npz.files if k.startswith("images_")
-            )
+            n_frames = next(npz[k].shape[0] for k in npz.files if k.startswith("images_"))
             for stream in self.streams:
                 if f"images_{stream}" not in npz.files:
                     continue
                 max_start = n_frames - (self.num_frames - 1) * self.frame_stride
                 if max_start <= 0:
                     continue
-                for frame_idx in range(0, max_start):
+                for frame_idx in range(max_start):
                     self.samples.append(
-                        {
-                            "clip_name": clip_name,
-                            "stream": stream,
-                            "frame_idx": frame_idx,
-                        }
+                        {"clip_name": clip_name, "stream": stream, "frame_idx": frame_idx}
                     )
+        if not self.samples:
+            raise RuntimeError(
+                f"No sequence samples found in data_root: {self.data_root}. "
+                f"Check that clips are long enough for num_key_frames={self.num_key_frames} "
+                f"and frame_stride={self.frame_stride}, and that clip_names/streams match."
+            )
 
     def __getitem__(self, idx: int):
         s = self.samples[idx]
@@ -75,24 +117,43 @@ class SequenceHandObjectDataset(HandObjectSegmentationDataset):
         npz = np.load(str(self.data_root / f"{clip_name}.npz"), mmap_mode="r")
 
         indices = [frame_idx + i * self.frame_stride for i in range(self.num_frames)]
-        images = []
-        for idx_frame in indices:
-            image = torch.tensor(
-                npz[f"images_{stream}"][idx_frame], dtype=torch.float32
-            ).permute(2, 0, 1) / 255.0
+        images, masks = [], []
+        for i in indices:
+            image = (
+                torch.tensor(npz[f"images_{stream}"][i], dtype=torch.float32)
+                .permute(2, 0, 1) / 255.0
+            )
+            right = torch.tensor(npz[f"masks_{stream}_hand_RIGHT"][i] > 0)
+            left  = torch.tensor(npz[f"masks_{stream}_hand_LEFT"][i]  > 0)
+            obj   = torch.tensor(npz[f"masks_{stream}_object"][i]     > 0)
+            background = ~(right | left | obj)
+            masks.append(torch.stack([right, left, obj, background], dim=0).float())
             images.append(image)
 
-        return torch.stack(images, dim=0)
+        images = torch.stack(images, dim=0)  # (T, 3, H, W)
+        masks  = torch.stack(masks,  dim=0)  # (T, 4, H, W)
+        if self.random_reverse and torch.rand(1).item() > 0.5:
+            images = torch.flip(images, dims=[0])
+            masks  = torch.flip(masks,  dims=[0])
+        return images, masks
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class TrainConfig:
     # Data
-    data_root: str = "diffsynth/data/training_data"
+    data_root: str = "/work/courses/3dv/team32/training_data_modal"
     streams: list[str] = None
     clip_names: list[str] = None
-    num_frames: int = 2
+    num_key_frames: int = 3
     frame_stride: int = 1
+    random_reverse: bool = True
+
+    # Which backbone submodules to unfreeze alongside the velocity heads.
+    # Keeping this list narrow limits the risk of catastrophic forgetting.
     backbone_unfreeze_substrings: list[str] = field(
         default_factory=lambda: [
             "visual_geometry_transformer.motion_fwd_blocks",
@@ -101,19 +162,44 @@ class TrainConfig:
         ]
     )
 
-    # Model
+    # Model paths
     reconstruction_model_path: str = "models/NeoVerse/reconstructor.ckpt"
+    hand_seg_model_path: str = "models/NeoVerse/hand_seg_model_opt_best.ckpt"
     save_model_path_prefix: str = "models/NeoVerse/velocity_regularization"
-    low_vram: bool = False
 
-    # Training
-    batch_size: int = 4
-    epochs: int = 5
+    # When True, freeze everything except velocity heads + backbone_unfreeze_substrings.
+    # When False, all parameters are trainable (use with a low learning rate).
+    freeze_except_velocity: bool = True
+
+    # Training hyperparameters
+    batch_size: int = 1
+    epochs: int = 10
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     grad_clip_norm: float = 1.0
-    preserve_foreground_weight: float = 1.0
+
+    # Loss weights
+    # -- true-GT losses (input video is the only GT we have) --
+    rgb_loss_weight: float = 1.0       # Lrgb: L2 + lpips_loss_weight * LPIPS
+    lpips_loss_weight: float = 0.1     # weight of LPIPS inside Lrgb
+    regularization_weight: float = 0.1 # Lregular: alpha coverage
+
+    # -- core goal: push background Gaussian velocities to zero --
+    bg_gaussian_vel_weight: float = 1.0
+
+    # -- distillation losses: prevent catastrophic forgetting --
+    # These use the frozen teacher as pseudo-GT; they carry no new information
+    # but stabilise all predictions that we are not deliberately changing.
+    camera_distill_weight: float = 5.0
+    depth_distill_weight: float = 1.0
+    preserve_foreground_vel_weight: float = 1.0  # pixel-vel head, fg pixels only
     preserve_segmentation_weight: float = 1.0
+
+    # LR schedule
+    warmup_steps: int = 500
+    lr_min_factor: float = 0.1
+
+    # Checkpointing
     checkpoint_interval_batches: int = 100
 
     # Environment
@@ -121,15 +207,41 @@ class TrainConfig:
 
     # Logging
     log_dir: str = field(
-        default_factory=lambda: "runs/velocity_regularization_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_factory=lambda: (
+            "runs/velocity_regularization_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
     )
     num_workers: int = 2
     pin_memory: bool = True
 
+    @property
+    def num_frames(self) -> int:
+        return 2 * self.num_key_frames - 1
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def dbg(msg: str):
     print(f"[DBG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+
+def detach_predictions(predictions: dict) -> dict:
+    """Return a shallow copy with every tensor detached.
+
+    Used to guard teacher outputs before passing them into the student renderer
+    so that no gradient can flow back through the teacher path.
+    """
+    return {
+        k: v.detach() if isinstance(v, torch.Tensor) else v
+        for k, v in predictions.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Model wrapper
+# ---------------------------------------------------------------------------
 
 class VelocityRegularizationModel:
     def __init__(self, cfg: TrainConfig):
@@ -143,118 +255,315 @@ class VelocityRegularizationModel:
             torch_dtype=torch.bfloat16,
         )
         self.reconstructor: WorldMirror = model_manager.fetch_model("reconstructor")
+        self.reconstructor.gs_renderer.training = False
+
+        if cfg.hand_seg_model_path is not None:
+            dbg(f"Loading hand_pred_head from {cfg.hand_seg_model_path} ...")
+            hand_ckpt = torch.load(cfg.hand_seg_model_path, map_location="cpu")
+            hand_sd = hand_ckpt.get("model_state_dict", hand_ckpt)
+            if not any(k.startswith("hand_pred_head.") for k in hand_sd):
+                hand_sd = {f"hand_pred_head.{k}": v for k, v in hand_sd.items()}
+            else:
+                hand_sd = {k: v for k, v in hand_sd.items() if k.startswith("hand_pred_head.")}
+            device = next(self.reconstructor.parameters()).device
+            hand_sd = {k: v.to(device) for k, v in hand_sd.items()}
+            self.reconstructor.load_state_dict(hand_sd, strict=False)
+            self.reconstructor.hand_pred_head.float()
+            dbg("hand_pred_head weights loaded.")
+
         dbg("Reconstructor loaded.")
 
+        # Frozen copy used as teacher / anti-forgetting anchor.
         self.teacher: WorldMirror = copy.deepcopy(self.reconstructor).eval()
         self.teacher.requires_grad_(False)
 
-        # Freeze current model parameters, then unfreeze velocity heads and selected backbone blocks.
-        self.reconstructor.requires_grad_(False)
-        n_train, n_total = 0, 0
-        for name, param in self.reconstructor.named_parameters():
-            n_total += 1
-            if "velocity_fwd_head" in name or "velocity_bwd_head" in name:
-                param.requires_grad = True
-                n_train += 1
-            elif any(sub in name for sub in cfg.backbone_unfreeze_substrings):
-                param.requires_grad = True
-                n_train += 1
-        dbg(f"Trainable parameters: {n_train}/{n_total}")
+        # --- Parameter freezing ---
+        if cfg.freeze_except_velocity:
+            self.reconstructor.requires_grad_(False)
+            n_train, n_total = 0, 0
+            for name, param in self.reconstructor.named_parameters():
+                n_total += 1
+                is_vel = "velocity_fwd_head" in name or "velocity_bwd_head" in name
+                is_backbone = any(sub in name for sub in cfg.backbone_unfreeze_substrings)
+                if is_vel or is_backbone:
+                    param.requires_grad = True
+                    n_train += 1
+            dbg(f"Trainable parameters: {n_train}/{n_total}")
+            if n_train == 0:
+                raise RuntimeError(
+                    "No parameters matched velocity heads or backbone_unfreeze_substrings. "
+                    "Check TrainConfig.backbone_unfreeze_substrings."
+                )
+        else:
+            self.reconstructor.requires_grad_(True)
 
-        if n_train == 0:
-            raise RuntimeError("No parameters matched velocity heads or backbone unfreeze substrings.")
+        # Velocity heads must always be float32 so loss gradients are stable.
+        self.reconstructor.velocity_fwd_head = self.reconstructor.velocity_fwd_head.float()
+        self.reconstructor.velocity_bwd_head = self.reconstructor.velocity_bwd_head.float()
+        for param in self.reconstructor.velocity_fwd_head.parameters():
+            param.requires_grad = True
+        for param in self.reconstructor.velocity_bwd_head.parameters():
+            param.requires_grad = True
 
-        self.reconstructor.eval()
         self.device = cfg.device
 
+        self.lpips_fn = None
+        if lpips_lib is not None:
+            try:
+                self.lpips_fn = lpips_lib.LPIPS(net="vgg").to(self.device)
+            except Exception:
+                self.lpips_fn = None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_views(self, images: torch.Tensor) -> dict:
+        B, T, C, H, W = images.shape
+        device = images.device
+
+        is_target = (
+            (torch.arange(T, device=device) % 2 == 1)
+            .unsqueeze(0)
+            .expand(B, T)
+        )
+
+        is_static = torch.zeros((B, T), dtype=torch.bool, device=device)
+
+        timestamps = (
+            torch.arange(T, device=device)
+            .unsqueeze(0)
+            .expand(B, T)
+        )
+
+        # NEW
+        valid_mask = torch.ones(
+            (B, T, H, W),
+            dtype=torch.bool,
+            device=device
+        )
+
+        return {
+            "img": images,
+            "is_target": is_target,
+            "is_static": is_static,
+            "timestamp": timestamps,
+            "valid_mask": valid_mask,
+        }
+
     def forward(self, images: torch.Tensor):
-        """Return predicted segmentation logits + velocity predictions."""
         images = images.to(self.device, non_blocking=True)
-        B, S, C, H, W = images.shape
-        assert S >= 2, "Velocity regularization requires at least 2 frames."
+        B, T, C, H, W = images.shape
+        assert T == self.cfg.num_frames, (
+            f"Expected {self.cfg.num_frames} frames, got {T}."
+        )
+        views = self._build_views(images)
+        with torch.amp.autocast(self.device, dtype=torch.bfloat16):
+            predictions = self.reconstructor(views, is_inference=False, use_motion=True)
+        return predictions, views
 
-        # Current model forward pass. The trainable backbone blocks here will receive gradients
-        # from the velocity and segmentation consistency losses.
-        token_list, patch_start_idx, fwd_token_list, bwd_token_list = self.reconstructor.visual_geometry_transformer(
-            images, use_motion=True
-        )
-        seg_logits, _ = self.reconstructor.hand_pred_head(
-            token_list, images=images, patch_start_idx=patch_start_idx
-        )
-        vel_fwd, _ = self.reconstructor.velocity_fwd_head(
-            fwd_token_list,
-            images=images[:, :-1],
-            patch_start_idx=patch_start_idx,
-        )
-        vel_bwd, _ = self.reconstructor.velocity_bwd_head(
-            bwd_token_list,
-            images=images[:, 1:],
-            patch_start_idx=patch_start_idx,
-        )
-
+    def forward_with_teacher(self, images: torch.Tensor):
+        predictions, views = self.forward(images)
         with torch.no_grad():
-            teacher_token_list, teacher_patch_start_idx, teacher_fwd_token_list, teacher_bwd_token_list = self.teacher.visual_geometry_transformer(
-                images, use_motion=True
-            )
-            seg_logits_ref, _ = self.teacher.hand_pred_head(
-                teacher_token_list, images=images, patch_start_idx=teacher_patch_start_idx
-            )
-            vel_fwd_ref, _ = self.teacher.velocity_fwd_head(
-                teacher_fwd_token_list,
-                images=images[:, :-1],
-                patch_start_idx=teacher_patch_start_idx,
-            )
-            vel_bwd_ref, _ = self.teacher.velocity_bwd_head(
-                teacher_bwd_token_list,
-                images=images[:, 1:],
-                patch_start_idx=teacher_patch_start_idx,
-            )
+            with torch.amp.autocast(self.device, dtype=torch.bfloat16):
+                teacher_predictions = self.teacher(views, is_inference=False, use_motion=True)
+        return predictions, teacher_predictions
 
-        return seg_logits, vel_fwd, vel_bwd, seg_logits_ref, vel_fwd_ref, vel_bwd_ref
+    def render_predictions(self, predictions: dict, height: int, width: int):
+        gaussians       = predictions["splats"]
+        render_c2w      = predictions["rendered_extrinsics"]
+        render_intrs    = predictions["rendered_intrinsics"]
+        render_timestamps = predictions["rendered_timestamps"]
+        render_w2c      = homo_matrix_inverse(render_c2w)
+
+        rendered_colors, rendered_depths, rendered_alphas, _ = (
+            self.reconstructor.gs_renderer.rasterizer.forward(
+                render_splats=gaussians,
+                render_viewmats=[render_w2c[b] for b in range(render_w2c.shape[0])],
+                render_Ks=[render_intrs[b] for b in range(render_intrs.shape[0])],
+                render_timestamps=[render_timestamps[b] for b in range(render_timestamps.shape[0])],
+                sh_degree=self.reconstructor.gs_renderer.sh_degree,
+                width=width,
+                height=height,
+            )
+        )
+        return rendered_colors, rendered_depths, rendered_alphas
+
+    def lpips_loss(self, rendered_colors: torch.Tensor, gt_images: torch.Tensor) -> torch.Tensor:
+        if self.lpips_fn is None:
+            return rendered_colors.new_zeros(())
+        B, T = rendered_colors.shape[:2]
+        flat_pred = rendered_colors.permute(0, 1, 4, 2, 3).reshape(-1, 3, rendered_colors.shape[2], rendered_colors.shape[3])
+        flat_gt   = gt_images.permute(0, 1, 4, 2, 3).reshape(-1, 3, gt_images.shape[2], gt_images.shape[3])
+        return self.lpips_fn(flat_pred * 2.0 - 1.0, flat_gt * 2.0 - 1.0).mean()
 
 
-def masked_background_velocity_loss(velocity: torch.Tensor, class_labels: torch.Tensor):
-    """Compute L2 loss only for pixels predicted as background (class 3)."""
-    mask = (class_labels == 3).unsqueeze(-1).float()
-    if mask.sum() == 0:
-        return velocity.new_zeros(())
-    return (velocity.pow(2) * mask).sum() / mask.sum()
+# ---------------------------------------------------------------------------
+# Loss functions
+# ---------------------------------------------------------------------------
+
+def gaussian_background_velocity_loss(predictions: dict) -> torch.Tensor:
+    """L2 norm penalty on velocities of Gaussians predicted as background (class 3).
+
+    predictions["splats"] is a list of Gaussian objects, one per keyframe.
+    We aggregate attributes across all keyframes before computing the loss.
+    """
+    splats_list = predictions["splats"]
+
+    # Collect attributes from each keyframe's Gaussian object
+    seg_list, vel_fwd_list, vel_bwd_list = [], [], []
+    for splat in splats_list:
+        # Access attributes — adjust key names if your Gaussian object uses
+        # different attribute names (e.g. splat.seg_labels vs splat["seg_labels"])
+        if isinstance(splat, dict):
+            seg_list.append(splat["seg_labels"])
+            vel_fwd_list.append(splat["velocity_fwd"])
+            vel_bwd_list.append(splat["velocity_bwd"])
+        else:
+            seg_list.append(splat.seg_labels)
+            vel_fwd_list.append(splat.velocity_fwd)
+            vel_bwd_list.append(splat.velocity_bwd)
+
+    # Concatenate across keyframes along the Gaussian dimension
+    gauss_seg     = torch.cat(seg_list,     dim=-2)  # (..., N_total, 4)
+    gauss_vel_fwd = torch.cat(vel_fwd_list, dim=-2)  # (..., N_total, 3)
+    gauss_vel_bwd = torch.cat(vel_bwd_list, dim=-2)
+
+    bg_mask = (gauss_seg.argmax(dim=-1) == 3).float()  # (..., N_total)
+
+    if bg_mask.sum() == 0:
+        return gauss_vel_fwd.new_zeros(())
+
+    loss_fwd = (gauss_vel_fwd.pow(2).sum(dim=-1) * bg_mask).sum() / bg_mask.sum()
+    loss_bwd = (gauss_vel_bwd.pow(2).sum(dim=-1) * bg_mask).sum() / bg_mask.sum()
+    return 0.5 * (loss_fwd + loss_bwd)
 
 
 def preserve_foreground_velocity_loss(
-    velocity: torch.Tensor,
-    reference: torch.Tensor,
-    class_labels: torch.Tensor,
+    predictions: dict,
+    teacher_predictions: dict,
+) -> torch.Tensor:
+    """Keep the pixel-space velocity head output close to the teacher on foreground pixels.
+
+    Uses the student's own segmentation prediction as the foreground mask so
+    that the mask is consistent with what the student currently believes.
+    Background pixels (class 3) are excluded — those are handled by
+    gaussian_background_velocity_loss above.
+    """
+    vel_fwd  = predictions["velocity_fwd"]        # (B, T-1, H, W, D)
+    vel_bwd  = predictions["velocity_bwd"]        # (B, T-1, H, W, D)
+    tvel_fwd = teacher_predictions["velocity_fwd"].detach()
+    tvel_bwd = teacher_predictions["velocity_bwd"].detach()
+
+    # seg_labels shape: (B, T, H, W, 4) — use all but the last / first frame
+    # to align with fwd/bwd velocity time indices.
+    seg = predictions["seg_labels"]
+    class_preds = seg.argmax(dim=-1)              # (B, T, H, W)
+    fg_fwd = (class_preds[:, :-1] != 3).unsqueeze(-1).float()  # (B, T-1, H, W, 1)
+    fg_bwd = (class_preds[:,  1:] != 3).unsqueeze(-1).float()
+
+    if fg_fwd.sum() == 0:
+        return vel_fwd.new_zeros(())
+
+    loss_fwd = ((vel_fwd - tvel_fwd).pow(2) * fg_fwd).sum() / fg_fwd.sum()
+    loss_bwd = ((vel_bwd - tvel_bwd).pow(2) * fg_bwd).sum() / fg_bwd.sum()
+    return 0.5 * (loss_fwd + loss_bwd)
+
+
+def camera_distillation_loss(predictions: dict, teacher_predictions: dict) -> torch.Tensor:
+    """Distill camera parameters from the frozen teacher (anti-forgetting).
+
+    Tries a priority list of camera-related keys and uses the first pair that
+    both student and teacher expose.  All teacher tensors are detached.
+    """
+    cam_key_pairs = [
+        ("rendered_extrinsics", "rendered_extrinsics"),
+        ("rendered_intrinsics", "rendered_intrinsics"),
+        ("camera_params",       "camera_params"),
+        ("camera_poses",        "camera_poses"),
+        ("camera_intrs",        "camera_intrs"),
+    ]
+    for sk, tk in cam_key_pairs:
+        if sk in predictions and tk in teacher_predictions:
+            return F.mse_loss(predictions[sk], teacher_predictions[tk].detach())
+    return predictions[next(iter(predictions))].new_zeros(())
+
+
+def depth_distillation_loss(
+    predictions: dict,
+    rendered_depths: torch.Tensor,
+    teacher_predictions: dict,
+    teacher_rendered_depths: torch.Tensor,
+) -> torch.Tensor:
+    """Distill depth from the frozen teacher (anti-forgetting).
+
+    Two complementary signals:
+      1. Rendered depth (student Gaussians) vs. teacher rendered depth —
+         pixel-aligned under the same camera trajectory.
+      2. Any explicit depth-head output present in both dicts.
+
+    All teacher tensors are detached.
+    """
+    device = rendered_depths.device if rendered_depths is not None else next(iter(predictions.values())).device
+    loss = torch.tensor(0.0, device=device)
+
+    if rendered_depths is not None and teacher_rendered_depths is not None:
+        loss = loss + F.l1_loss(rendered_depths, teacher_rendered_depths.detach())
+
+    for key in ("depth", "depthmap", "predicted_depth"):
+        if key in predictions and key in teacher_predictions:
+            loss = loss + F.l1_loss(predictions[key], teacher_predictions[key].detach())
+            break
+
+    return loss
+
+
+def segmentation_distillation_loss(
+    predictions: dict,
+    teacher_predictions: dict,
+) -> torch.Tensor:
+    """Keep segmentation logits close to the teacher (anti-forgetting)."""
+    return F.mse_loss(
+        predictions["seg_labels"],
+        teacher_predictions["seg_labels"].detach(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(
+    model: VelocityRegularizationModel,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    loss: float,
+    cfg: TrainConfig,
+    suffix: str = "",
 ):
-    """Keep velocity for classes 0-2 close to the pretrained reference."""
-    mask = (class_labels != 3).unsqueeze(-1).float()
-    if mask.sum() == 0:
-        return velocity.new_zeros(())
-    return ((velocity - reference).pow(2) * mask).sum() / mask.sum()
-
-
-def segmentation_consistency_loss(pred_logits: torch.Tensor, ref_logits: torch.Tensor):
-    """Preserve segmentation predictions when partially unfreezing the backbone."""
-    return F.mse_loss(pred_logits, ref_logits)
-
-
-def save_checkpoint(model: VelocityRegularizationModel, optimizer, epoch: int, loss: float, cfg: TrainConfig):
-    ckpt = {
-        "epoch": epoch,
-        "model_state_dict": model.reconstructor.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "loss": loss,
-    }
-    path = f"{cfg.save_model_path_prefix}_epoch{epoch+1}.ckpt"
-    torch.save(ckpt, path)
+    path = f"{cfg.save_model_path_prefix}_epoch{epoch + 1}{suffix}.ckpt"
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.reconstructor.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": loss,
+        },
+        path,
+    )
     dbg(f"Saved checkpoint: {path}")
 
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
 def train(cfg: TrainConfig):
     dataset = SequenceHandObjectDataset(
         data_root=cfg.data_root,
-        num_frames=cfg.num_frames,
+        num_key_frames=cfg.num_key_frames,
         frame_stride=cfg.frame_stride,
+        random_reverse=cfg.random_reverse,
         streams=cfg.streams,
         clip_names=cfg.clip_names,
     )
@@ -268,43 +577,114 @@ def train(cfg: TrainConfig):
     )
 
     model = VelocityRegularizationModel(cfg)
-    optimizer = cfg.optimizer(
+    optimizer = torch.optim.AdamW(
         [p for p in model.reconstructor.parameters() if p.requires_grad],
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
-    ) 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=len(loader) * cfg.epochs, eta_min=cfg.learning_rate * 0.1
     )
-    writer = SummaryWriter(cfg.log_dir)
 
-    dbg(f"Training on {len(dataset)} sequences, {len(loader)} batches per epoch.")
+    total_steps = len(loader) * cfg.epochs
+    if cfg.warmup_steps > 0 and cfg.warmup_steps < total_steps:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=cfg.warmup_steps
+        )
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(total_steps - cfg.warmup_steps, 1),
+            eta_min=cfg.learning_rate * cfg.lr_min_factor,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[cfg.warmup_steps]
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(total_steps, 1),
+            eta_min=cfg.learning_rate * cfg.lr_min_factor,
+        )
+
+    writer = SummaryWriter(cfg.log_dir)
+    dbg(f"Training on {len(dataset)} sequences, {len(loader)} batches/epoch.")
     best_loss = float("inf")
 
     for epoch in range(cfg.epochs):
         model.reconstructor.train()
         epoch_loss = 0.0
-        step = 0
-        start_time = time.time()
+        t0 = time.time()
 
-        for batch_idx, images in enumerate(loader):
+        for batch_idx, (images, _gt_masks) in enumerate(loader):
+            # _gt_masks are available for inspection / future use but are not
+            # used as training signal here — we rely on the model's own
+            # segmentation predictions so the loss stays self-consistent.
             optimizer.zero_grad()
-            seg_logits, vel_fwd, vel_bwd, seg_logits_ref, vel_fwd_ref, vel_bwd_ref = model.forward(images)
 
-            class_preds = seg_logits.argmax(dim=-1)
-            loss_fwd = masked_background_velocity_loss(vel_fwd, class_preds[:, :-1])
-            loss_bwd = masked_background_velocity_loss(vel_bwd, class_preds[:, 1:])
-            preserve_fwd = preserve_foreground_velocity_loss(
-                vel_fwd, vel_fwd_ref, class_preds[:, :-1]
-            )
-            preserve_bwd = preserve_foreground_velocity_loss(
-                vel_bwd, vel_bwd_ref, class_preds[:, 1:]
-            )
-            loss_seg = segmentation_consistency_loss(seg_logits, seg_logits_ref)
+            # ---- forward passes ----------------------------------------
+            predictions, teacher_predictions = model.forward_with_teacher(images)
 
-            loss = 0.5 * (loss_fwd + loss_bwd)
-            loss = loss + cfg.preserve_foreground_weight * 0.5 * (preserve_fwd + preserve_bwd)
-            loss = loss + cfg.preserve_segmentation_weight * loss_seg
+            # Student render
+            H, W = images.shape[-2], images.shape[-1]
+            rendered_colors, rendered_depths, rendered_alphas = model.render_predictions(
+                predictions, height=H, width=W
+            )
+
+            # Teacher render — completely outside the autograd graph.
+            # detach_predictions() ensures no tensor aliasing leaks gradients.
+            with torch.no_grad():
+                safe_teacher = detach_predictions(teacher_predictions)
+                _, teacher_rendered_depths, _ = model.render_predictions(
+                    safe_teacher, height=H, width=W
+                )
+
+            # ---- true-GT losses (input video) --------------------------
+            
+
+            # Lrgb: photometric reconstruction
+            gt_images   = images.to(model.device).permute(0, 1, 3, 4, 2)  # (B,T,H,W,3)
+            rgb_l2_loss = F.mse_loss(rendered_colors, gt_images)
+            lpips_loss  = (
+                model.lpips_loss(rendered_colors, gt_images)
+                if cfg.lpips_loss_weight > 0
+                else rendered_colors.new_zeros(())
+            )
+            rgb_loss = rgb_l2_loss + cfg.lpips_loss_weight * lpips_loss
+
+            # Lregular: prevent Gaussians from going transparent
+            reg_loss = F.l1_loss(rendered_alphas, torch.ones_like(rendered_alphas))
+
+            # ---- core goal: background Gaussian velocity → 0 -----------
+            # This operates on per-Gaussian attributes inside predictions["splats"].
+            # If your WorldMirror version does not expose per-Gaussian seg_labels /
+            # velocity_fwd / velocity_bwd inside the splats dict, replace this call
+            # with the appropriate access pattern.
+            print("Predictions have seg labels: ", ("seg_labels" in predictions))
+            bg_vel_loss = gaussian_background_velocity_loss(predictions)
+
+            # ---- distillation losses (anti-forgetting) -----------------
+
+            # Keep camera predictions stable
+            camera_loss = camera_distillation_loss(predictions, teacher_predictions)
+
+            # Keep depth predictions stable (rendered + head)
+            depth_loss = depth_distillation_loss(
+                predictions, rendered_depths, teacher_predictions, teacher_rendered_depths
+            )
+
+            # Keep foreground pixel-velocity head stable
+            preserve_fg_loss = preserve_foreground_velocity_loss(predictions, teacher_predictions)
+
+            # Keep segmentation head stable
+            seg_loss = segmentation_distillation_loss(predictions, teacher_predictions)
+
+            # ---- total loss --------------------------------------------
+            loss = (
+                cfg.rgb_loss_weight            * rgb_loss
+                + cfg.regularization_weight    * reg_loss
+                + cfg.bg_gaussian_vel_weight   * bg_vel_loss
+                + cfg.camera_distill_weight    * camera_loss
+                + cfg.depth_distill_weight     * depth_loss
+                + cfg.preserve_foreground_vel_weight * preserve_fg_loss
+                + cfg.preserve_segmentation_weight   * seg_loss
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -314,33 +694,39 @@ def train(cfg: TrainConfig):
             optimizer.step()
             scheduler.step()
 
-            loss_value = loss.item()
-            epoch_loss += loss_value
-            step += 1
+            loss_val = loss.item()
+            epoch_loss += loss_val
+            step = epoch * len(loader) + batch_idx
 
-            writer.add_scalar("train/loss_step", loss_value, epoch * len(loader) + batch_idx)
-            writer.add_scalar("train/lr", scheduler.get_last_lr()[0], epoch * len(loader) + batch_idx)
-            writer.add_scalar("train/loss_fwd", loss_fwd.item(), epoch * len(loader) + batch_idx)
-            writer.add_scalar("train/loss_bwd", loss_bwd.item(), epoch * len(loader) + batch_idx)
-            writer.add_scalar("train/loss_preserve_fwd", preserve_fwd.item(), epoch * len(loader) + batch_idx)
-            writer.add_scalar("train/loss_preserve_bwd", preserve_bwd.item(), epoch * len(loader) + batch_idx)
-            writer.add_scalar("train/loss_seg_consistency", loss_seg.item(), epoch * len(loader) + batch_idx)
+            # ---- logging -----------------------------------------------
+            writer.add_scalar("train/loss_step",          loss_val,                step)
+            writer.add_scalar("train/lr",                 scheduler.get_last_lr()[0], step)
+            writer.add_scalar("train/rgb_l2",             rgb_l2_loss.item(),      step)
+            writer.add_scalar("train/lpips",              lpips_loss.item(),        step)
+            writer.add_scalar("train/rgb_loss",           rgb_loss.item(),          step)
+            writer.add_scalar("train/alpha_reg",          reg_loss.item(),          step)
+            writer.add_scalar("train/bg_gaussian_vel",    bg_vel_loss.item(),       step)
+            writer.add_scalar("train/camera_distill",     camera_loss.item(),       step)
+            writer.add_scalar("train/depth_distill",      depth_loss.item(),        step)
+            writer.add_scalar("train/preserve_fg_vel",    preserve_fg_loss.item(),  step)
+            writer.add_scalar("train/seg_distill",        seg_loss.item(),          step)
 
             if batch_idx % 10 == 0:
                 dbg(
-                    f"Epoch {epoch+1}/{cfg.epochs} batch {batch_idx}/{len(loader)} "
-                    f"loss={loss_value:.6f} loss_fwd={loss_fwd.item():.6f} "
-                    f"loss_bwd={loss_bwd.item():.6f}"
+                    f"Epoch {epoch+1}/{cfg.epochs}  batch {batch_idx}/{len(loader)}  "
+                    f"loss={loss_val:.5f}  rgb={rgb_loss.item():.5f}  "
+                    f"bg_vel={bg_vel_loss.item():.5f}  "
+                    f"cam={camera_loss.item():.5f}  depth={depth_loss.item():.5f}"
                 )
 
             if cfg.checkpoint_interval_batches > 0 and (batch_idx + 1) % cfg.checkpoint_interval_batches == 0:
-                save_checkpoint(model, optimizer, epoch, loss_value, cfg)
+                save_checkpoint(model, optimizer, epoch, loss_val, cfg)
 
-        avg_loss = epoch_loss / max(step, 1)
-        elapsed = time.time() - start_time
-        dbg(f"Epoch {epoch+1}/{cfg.epochs} avg_loss={avg_loss:.6f} ({elapsed:.0f}s)")
-
+        avg_loss = epoch_loss / max(len(loader), 1)
+        elapsed  = time.time() - t0
+        dbg(f"Epoch {epoch+1}/{cfg.epochs}  avg_loss={avg_loss:.5f}  ({elapsed:.0f}s)")
         writer.add_scalar("train/loss_epoch", avg_loss, epoch)
+
         save_checkpoint(model, optimizer, epoch, avg_loss, cfg)
 
         if avg_loss < best_loss:
@@ -354,14 +740,19 @@ def train(cfg: TrainConfig):
                 },
                 f"{cfg.save_model_path_prefix}_best.ckpt",
             )
-            dbg(f"New best loss: {best_loss:.6f}")
+            dbg(f"New best loss: {best_loss:.5f}")
 
+    writer.close()
     dbg("Training finished.")
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     cfg = TrainConfig()
-    os.makedirs(cfg.save_model_path_prefix.rsplit(".", 1)[0], exist_ok=True)
+    os.makedirs(cfg.save_model_path_prefix.rsplit("/", 1)[0], exist_ok=True)
     os.makedirs(cfg.log_dir, exist_ok=True)
     train(cfg)
 

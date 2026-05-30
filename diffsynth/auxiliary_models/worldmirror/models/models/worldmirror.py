@@ -381,11 +381,15 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 )
                 preds["gs_fwd_attr"] = gs_fwd_attr
                 preds["gs_bwd_attr"] = gs_bwd_attr
+            render_views = dict(views)
+            render_views["camera_poses"] = c2w_mat
+            render_views["camera_intrs"] = int_mat
+
             preds = self.gs_renderer.render(
                 gs_feats=gs_feat,
                 images=imgs,
                 predictions=preds,
-                views=views,
+                views=render_views,
                 context_predictions=context_preds,
                 is_inference=is_inference
             )

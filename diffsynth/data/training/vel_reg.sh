@@ -2,10 +2,11 @@
 #SBATCH --account=3dv
 #SBATCH --job-name=gs_mask_train
 #SBATCH --partition=jobs
+#SBATCH --gpus=5060ti:1
 #SBATCH --time=2-06:00:00
-#SBATCH --chdir=/work/courses/3dv/team32/handy-NeoVerse
-#SBATCH --output=/work/courses/3dv/team32/handy-NeoVerse/logs/vel_reg_train_%j.out
-#SBATCH --error=/work/courses/3dv/team32/handy-NeoVerse/logs/vel_reg_train_%j.err
+#SBATCH --chdir=/work/courses/3dv/team32/hands-on-neoverse
+#SBATCH --output=/work/courses/3dv/team32/hands-on-neoverse/logs/vel_reg_train_%j.out
+#SBATCH --error=/work/courses/3dv/team32/hands-on-neoverse/logs/vel_reg_train_%j.err
 
 set -eo pipefail
 
@@ -33,7 +34,7 @@ echo "Python:        $(which python) ($(python --version 2>&1))"
 echo "------------------------------------------"
 
 START=$(date +%s)
-python -u -m diffsynth.data.training.training_gs_mask
+python -u -m diffsynth.data.training.velocity_regularization
 EXIT_CODE=$?
 END=$(date +%s)
 

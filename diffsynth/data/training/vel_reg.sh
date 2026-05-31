@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=3dv
-#SBATCH --job-name=gs_mask_train
+#SBATCH --job-name=vel_reg
 #SBATCH --partition=jobs
 #SBATCH --gpus=5060ti:1
 #SBATCH --time=2-06:00:00

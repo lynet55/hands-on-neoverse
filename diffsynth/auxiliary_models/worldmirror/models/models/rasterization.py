@@ -604,14 +604,15 @@ class GaussianSplatRenderer(nn.Module):
             scale_factor = torch.ones(
                 (B, 1), device=pred_all_extrinsic.device, dtype=pred_all_extrinsic.dtype
             )
-            if "camera_poses" in context_predictions:
+            if "camera_poses" in context_predictions and not self.training:
                 pred_context_extrinsic, _ = self.prepare_cameras(context_predictions, S)
                 scale_factor = pred_context_extrinsic[:, :, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True) / (
                     pred_all_extrinsic[:, :S, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True) + 1e-6
                 )
                 scale_factor = scale_factor.unsqueeze(-1)
+                print("fucking shit up now")
+                pred_all_extrinsic[..., :3, 3] = pred_all_extrinsic[..., :3, 3] * scale_factor
 
-            pred_all_extrinsic[..., :3, 3] = pred_all_extrinsic[..., :3, 3] * scale_factor
             render_viewmats, render_Ks = pred_all_extrinsic, pred_all_intrinsic
             valid_masks = views.get("valid_mask", torch.ones(B, S + V, H, W, dtype=bool, device=images.device))
             render_timestamps = views["timestamp"]

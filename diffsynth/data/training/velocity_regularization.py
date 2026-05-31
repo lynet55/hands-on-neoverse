@@ -370,11 +370,13 @@ class VelocityRegularizationModel:
         return predictions, teacher_predictions
 
     def render_predictions(self, predictions: dict, height: int, width: int):
-        gaussians       = predictions["splats"]
-        render_c2w      = predictions["rendered_extrinsics"]
-        render_intrs    = predictions["rendered_intrinsics"]
-        render_timestamps = predictions["rendered_timestamps"]
-        render_w2c      = homo_matrix_inverse(render_c2w)
+        gaussians         = predictions["splats"]
+        # Clone these so the renderer's in-place ops (pred_all_extrinsic[...,:3,3] *= scale)
+        # don't corrupt the autograd graph built during the student forward pass.
+        render_c2w        = predictions["rendered_extrinsics"].clone()
+        render_intrs      = predictions["rendered_intrinsics"].clone()
+        render_timestamps = predictions["rendered_timestamps"].clone()
+        render_w2c        = homo_matrix_inverse(render_c2w)
 
         rendered_colors, rendered_depths, rendered_alphas, _ = (
             self.reconstructor.gs_renderer.rasterizer.forward(
@@ -403,39 +405,26 @@ class VelocityRegularizationModel:
 # ---------------------------------------------------------------------------
 
 def gaussian_background_velocity_loss(predictions: dict) -> torch.Tensor:
-    """L2 norm penalty on velocities of Gaussians predicted as background (class 3).
+    """L2 norm penalty on velocities of background pixels (class 3).
 
-    predictions["splats"] is a list of Gaussian objects, one per keyframe.
-    We aggregate attributes across all keyframes before computing the loss.
+    Mirrors preserve_foreground_velocity_loss: reads velocity and seg directly
+    from the top-level predictions dict instead of per-Gaussian splat attributes.
     """
-    splats_list = predictions["splats"]
+    vel_fwd = predictions["velocity_fwd"]  # (B, T-1, H, W, D)
+    vel_bwd = predictions["velocity_bwd"]  # (B, T-1, H, W, D)
 
-    # Collect attributes from each keyframe's Gaussian object
-    seg_list, vel_fwd_list, vel_bwd_list = [], [], []
-    for splat in splats_list:
-        # Access attributes — adjust key names if your Gaussian object uses
-        # different attribute names (e.g. splat.seg_labels vs splat["seg_labels"])
-        if isinstance(splat, dict):
-            seg_list.append(splat["seg_labels"])
-            vel_fwd_list.append(splat["velocity_fwd"])
-            vel_bwd_list.append(splat["velocity_bwd"])
-        else:
-            seg_list.append(splat.seg_labels)
-            vel_fwd_list.append(splat.velocity_fwd)
-            vel_bwd_list.append(splat.velocity_bwd)
+    seg = predictions["seg_labels"]        # (B, T, H, W, 4)
+    print(seg.shape)
+    B, T, H, W, classes = seg.shape
+    class_preds = seg.argmax(dim=-1)       # (B, T, H, W)
+    bg_fwd = (class_preds[:, :-1] == classes - 1).unsqueeze(-1).float()  # (B, T-1, H, W, 1)
+    bg_bwd = (class_preds[:,  1:] == classes - 1).unsqueeze(-1).float()
 
-    # Concatenate across keyframes along the Gaussian dimension
-    gauss_seg     = torch.cat(seg_list,     dim=-2)  # (..., N_total, 4)
-    gauss_vel_fwd = torch.cat(vel_fwd_list, dim=-2)  # (..., N_total, 3)
-    gauss_vel_bwd = torch.cat(vel_bwd_list, dim=-2)
+    if bg_fwd.sum() == 0:
+        return vel_fwd.new_zeros(())
 
-    bg_mask = (gauss_seg.argmax(dim=-1) == 3).float()  # (..., N_total)
-
-    if bg_mask.sum() == 0:
-        return gauss_vel_fwd.new_zeros(())
-
-    loss_fwd = (gauss_vel_fwd.pow(2).sum(dim=-1) * bg_mask).sum() / bg_mask.sum()
-    loss_bwd = (gauss_vel_bwd.pow(2).sum(dim=-1) * bg_mask).sum() / bg_mask.sum()
+    loss_fwd = (vel_fwd.pow(2) * bg_fwd).sum() / bg_fwd.sum()
+    loss_bwd = (vel_bwd.pow(2) * bg_bwd).sum() / bg_bwd.sum()
     return 0.5 * (loss_fwd + loss_bwd)
 
 
@@ -452,8 +441,8 @@ def preserve_foreground_velocity_loss(
     """
     vel_fwd  = predictions["velocity_fwd"]        # (B, T-1, H, W, D)
     vel_bwd  = predictions["velocity_bwd"]        # (B, T-1, H, W, D)
-    tvel_fwd = teacher_predictions["velocity_fwd"].detach()
-    tvel_bwd = teacher_predictions["velocity_bwd"].detach()
+    tvel_fwd = teacher_predictions["velocity_fwd"].detach().clone()
+    tvel_bwd = teacher_predictions["velocity_bwd"].detach().clone()
 
     # seg_labels shape: (B, T, H, W, 4) — use all but the last / first frame
     # to align with fwd/bwd velocity time indices.
@@ -485,7 +474,7 @@ def camera_distillation_loss(predictions: dict, teacher_predictions: dict) -> to
     ]
     for sk, tk in cam_key_pairs:
         if sk in predictions and tk in teacher_predictions:
-            return F.mse_loss(predictions[sk], teacher_predictions[tk].detach())
+            return F.mse_loss(predictions[sk], teacher_predictions[tk].detach().clone())
     return predictions[next(iter(predictions))].new_zeros(())
 
 
@@ -512,7 +501,7 @@ def depth_distillation_loss(
 
     for key in ("depth", "depthmap", "predicted_depth"):
         if key in predictions and key in teacher_predictions:
-            loss = loss + F.l1_loss(predictions[key], teacher_predictions[key].detach())
+            loss = loss + F.l1_loss(predictions[key], teacher_predictions[key].detach().clone())
             break
 
     return loss
@@ -525,7 +514,7 @@ def segmentation_distillation_loss(
     """Keep segmentation logits close to the teacher (anti-forgetting)."""
     return F.mse_loss(
         predictions["seg_labels"],
-        teacher_predictions["seg_labels"].detach(),
+        teacher_predictions["seg_labels"].detach().clone(),
     )
 
 
@@ -606,7 +595,7 @@ def train(cfg: TrainConfig):
     writer = SummaryWriter(cfg.log_dir)
     dbg(f"Training on {len(dataset)} sequences, {len(loader)} batches/epoch.")
     best_loss = float("inf")
-
+    torch.autograd.set_detect_anomaly(True)
     for epoch in range(cfg.epochs):
         model.reconstructor.train()
         epoch_loss = 0.0
@@ -630,11 +619,16 @@ def train(cfg: TrainConfig):
             # Teacher render — completely outside the autograd graph.
             # detach_predictions() ensures no tensor aliasing leaks gradients.
             with torch.no_grad():
-                safe_teacher = detach_predictions(teacher_predictions)
+                # Deep-clone all tensors to break any storage sharing with the student graph
+                safe_teacher = {
+                    k: v.clone() if isinstance(v, torch.Tensor) else
+                    {sk: sv.clone() if isinstance(sv, torch.Tensor) else sv
+                        for sk, sv in v.items()} if isinstance(v, dict) else v
+                    for k, v in teacher_predictions.items()
+                }
                 _, teacher_rendered_depths, _ = model.render_predictions(
                     safe_teacher, height=H, width=W
                 )
-
             # ---- true-GT losses (input video) --------------------------
             
 
@@ -656,7 +650,6 @@ def train(cfg: TrainConfig):
             # If your WorldMirror version does not expose per-Gaussian seg_labels /
             # velocity_fwd / velocity_bwd inside the splats dict, replace this call
             # with the appropriate access pattern.
-            print("Predictions have seg labels: ", ("seg_labels" in predictions))
             bg_vel_loss = gaussian_background_velocity_loss(predictions)
 
             # ---- distillation losses (anti-forgetting) -----------------
@@ -755,6 +748,7 @@ def main():
     os.makedirs(cfg.save_model_path_prefix.rsplit("/", 1)[0], exist_ok=True)
     os.makedirs(cfg.log_dir, exist_ok=True)
     train(cfg)
+
 
 
 if __name__ == "__main__":

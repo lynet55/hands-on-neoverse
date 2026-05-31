@@ -404,7 +404,7 @@ class VelocityRegularizationModel:
 # Loss functions
 # ---------------------------------------------------------------------------
 
-def gaussian_background_velocity_loss(predictions: dict) -> torch.Tensor:
+def gaussian_background_velocity_loss(predictions: dict, teacher_predictions: dict) -> torch.Tensor:
     """L2 norm penalty on velocities of background pixels (class 3).
 
     Mirrors preserve_foreground_velocity_loss: reads velocity and seg directly
@@ -413,7 +413,8 @@ def gaussian_background_velocity_loss(predictions: dict) -> torch.Tensor:
     vel_fwd = predictions["velocity_fwd"]  # (B, T-1, H, W, D)
     vel_bwd = predictions["velocity_bwd"]  # (B, T-1, H, W, D)
 
-    seg = predictions["seg_labels"]        # (B, T, H, W, 4)
+    seg = teacher_predictions["seg_labels"].detach().clone()        # (B, T, H, W, 4)
+
     print(seg.shape)
     B, T, H, W, classes = seg.shape
     class_preds = seg.argmax(dim=-1)       # (B, T, H, W)
@@ -446,7 +447,7 @@ def preserve_foreground_velocity_loss(
 
     # seg_labels shape: (B, T, H, W, 4) — use all but the last / first frame
     # to align with fwd/bwd velocity time indices.
-    seg = predictions["seg_labels"]
+    seg = teacher_predictions["seg_labels"].detach().clone()
     class_preds = seg.argmax(dim=-1)              # (B, T, H, W)
     fg_fwd = (class_preds[:, :-1] != 3).unsqueeze(-1).float()  # (B, T-1, H, W, 1)
     fg_bwd = (class_preds[:,  1:] != 3).unsqueeze(-1).float()
@@ -650,7 +651,7 @@ def train(cfg: TrainConfig):
             # If your WorldMirror version does not expose per-Gaussian seg_labels /
             # velocity_fwd / velocity_bwd inside the splats dict, replace this call
             # with the appropriate access pattern.
-            bg_vel_loss = gaussian_background_velocity_loss(predictions)
+            bg_vel_loss = gaussian_background_velocity_loss(predictions, teacher_predictions)
 
             # ---- distillation losses (anti-forgetting) -----------------
 

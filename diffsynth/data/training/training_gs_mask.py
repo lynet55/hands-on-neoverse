@@ -271,7 +271,11 @@ class GsMaskReconstructor:
             batch_rgbs.append(rendered_rgb)      # [1, H, W, 3]
             batch_depths.append(rendered_depth)  # [1, H, W, 1]
             batch_alphas.append(rendered_alpha)  # [1, H, W, 1]
+<<<<<<< Updated upstream
             batch_masks.append(rendered_masks)  # [1, H, W, C]
+=======
+            batch_masks.append(rendered_masks)   # [1, H, W, C]
+>>>>>>> Stashed changes
 
         # [B, H, W, C] -> [B, C, H, W] for loss
         rendered_masks = torch.cat(batch_masks, dim=0)          # [B, H, W, C]

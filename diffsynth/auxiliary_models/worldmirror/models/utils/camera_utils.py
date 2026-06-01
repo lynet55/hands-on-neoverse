@@ -62,8 +62,9 @@ def vector_to_camera_matrices(
     # Build intrinsic if needed
     if build_intr:
         h, w = image_hw
-        fy = h * 0.5 / torch.tan(fov_v * 0.5)
-        fx = w * 0.5 / torch.tan(fov_u * 0.5)
+
+        fy = h * 0.5 / torch.tan(torch.clamp(fov_v, min=1e-6, max=(torch.pi - 1e-6)) * 0.5)
+        fx = w * 0.5 / torch.tan(torch.clamp(fov_u, min=1e-6, max=(torch.pi - 1e-6)) * 0.5)
         shape = cam_vec.shape[:-1] + (3, 3)
         intr = torch.zeros(shape, device=cam_vec.device, dtype=cam_vec.dtype)
         intr[..., 0, 0] = fx

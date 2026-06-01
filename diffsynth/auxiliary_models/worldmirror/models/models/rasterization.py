@@ -610,7 +610,6 @@ class GaussianSplatRenderer(nn.Module):
                     pred_all_extrinsic[:, :S, :3, 3].norm(dim=-1).mean(dim=1, keepdim=True) + 1e-6
                 )
                 scale_factor = scale_factor.unsqueeze(-1)
-                print("fucking shit up now")
                 pred_all_extrinsic[..., :3, 3] = pred_all_extrinsic[..., :3, 3] * scale_factor
 
             render_viewmats, render_Ks = pred_all_extrinsic, pred_all_intrinsic

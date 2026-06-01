@@ -415,7 +415,6 @@ def gaussian_background_velocity_loss(predictions: dict, teacher_predictions: di
 
     seg = teacher_predictions["seg_labels"].detach().clone()        # (B, T, H, W, 4)
 
-    print(seg.shape)
     B, T, H, W, classes = seg.shape
     class_preds = seg.argmax(dim=-1)       # (B, T, H, W)
     bg_fwd = (class_preds[:, :-1] == classes - 1).unsqueeze(-1).float()  # (B, T-1, H, W, 1)
@@ -714,6 +713,7 @@ def train(cfg: TrainConfig):
                 )
 
             if cfg.checkpoint_interval_batches > 0 and (batch_idx + 1) % cfg.checkpoint_interval_batches == 0:
+                print("inside checkpoint saving")
                 save_checkpoint(model, optimizer, epoch, loss_val, cfg)
 
         avg_loss = epoch_loss / max(len(loader), 1)

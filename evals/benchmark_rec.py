@@ -1,0 +1,1144 @@
+"""Reconstruction + segmentation benchmark for the NeoVerse reconstructor.
+
+
+Mirrors the data path of ``training_25_04.py`` and the inference path of
+``reconstruction_demo.py`` so the numbers we report match what the model
+actually does in training and serving.
+
+Two metric families, both on input viewpoints (no novel-view here):
+  - Segmentation: mIoU, per-class IoU, pixel accuracy, boundary-F1.
+    mIoU/IoU/accuracy come from a single accumulated confusion matrix —
+    not per-batch averaging, which is biased when class frequencies vary.
+  - Rendering: PSNR / SSIM / LPIPS via torchmetrics, on the splat re-render
+    at the input cameras.
+
+Aggregation: metrics are computed per (clip, stream) window, then averaged
+across (clip, stream) groups so long clips don't dominate.
+
+Default mode is ``seg_compare``: it benchmarks the two segmentation models on the
+same val windows and writes a side-by-side comparison —
+  - hand_seg: base reconstructor + hand_pred_head, scored on predictions["seg_labels"].
+  - gs_mask:  same reconstructor + gs_mask gs_head, scored on the rasterized mask channels.
+
+Output:
+  logs/benchmark_logs/<run_id>/
+    config.json
+    aggregate_<label>.json   # per-model means + confusion matrix
+    baselines_<label>.json   # majority-class mIoU
+    per_clip_<label>.csv     # one row per (clip, stream)
+    comparison.json          # both models + (B - A) deltas per metric (incl. per-class IoU)
+    comparison_segmentation.csv
+"""
+
+import argparse
+import csv
+import json
+import math
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+from torchmetrics.image import (
+    LearnedPerceptualImagePatchSimilarity,
+    PeakSignalNoiseRatio,
+    StructuralSimilarityIndexMeasure,
+)
+
+from NeoVerse.diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
+from training.SimpleHandObjectSegmentationDataset import STREAMS
+from evals.bechmark_interpolation import render_interpolated_targets
+from NeoVerse.diffsynth.models.model_manager import ModelManager
+from NeoVerse.diffsynth.utils.auxiliary import homo_matrix_inverse
+
+
+CLASS_NAMES = ["right_hand", "left_hand", "object", "background"]
+
+
+# ===================================================================== #
+#                                 DATA                                  #
+# ===================================================================== #
+
+
+def get_val_clips(data_root: str, val_fraction: float) -> set[str]:
+    """Reproduce the train/val split used by training_25_04.py.
+
+    Both scripts must derive the split from the same sorted glob and the
+    same fraction, otherwise the benchmark leaks training clips.
+    """
+    all_clips = sorted(p.stem for p in Path(data_root).glob("clip-*.npz"))
+    if not all_clips:
+        raise FileNotFoundError(f"No clip-*.npz under {data_root}")
+    n_val = max(1, int(len(all_clips) * val_fraction))
+    return set(all_clips[-n_val:])
+
+
+class ClipWindowDataset(Dataset):
+    """One sample = one window of consecutive frames from a single (clip, stream).
+
+    The reconstructor consumes frames as a sequence S; we therefore pre-group
+    frames into windows of size ``window_size``. With ``batch_size=1`` this
+    yields ``[1, S, 3, H, W]`` images and ``[1, S, 4, H, W]`` one-hot masks —
+    the exact shape the reconstructor and the demo expect.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        window_size: int,
+        frame_stride: int,
+        clip_names: set[str] | None,
+        streams: list[str] | None = None,
+    ):
+        self.data_root = Path(data_root)
+        self.window_size = window_size
+        self.streams = streams or STREAMS
+        self.windows: list[tuple[str, str, list[int]]] = []
+
+        for npz_path in sorted(self.data_root.glob("clip-*.npz")):
+            clip = npz_path.stem
+            if clip_names is not None and clip not in clip_names:
+                continue
+            npz = np.load(str(npz_path), mmap_mode="r")
+            n_frames = next(
+                npz[k].shape[0] for k in npz.files if k.startswith("images_")
+            )
+            sampled = list(range(0, n_frames, frame_stride))
+            for stream in self.streams:
+                if f"images_{stream}" not in npz.files:
+                    continue
+                for i in range(0, len(sampled), window_size):
+                    win = sampled[i : i + window_size]
+                    if len(win) < 2:
+                        continue
+                    self.windows.append((clip, stream, win))
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int):
+        clip, stream, frame_idxs = self.windows[idx]
+        npz = np.load(str(self.data_root / f"{clip}.npz"), mmap_mode="r")
+
+        images, masks = [], []
+        for f in frame_idxs:
+            img = torch.tensor(
+                npz[f"images_{stream}"][f], dtype=torch.float32
+            ).permute(2, 0, 1) / 255.0
+            right = torch.tensor(npz[f"masks_{stream}_hand_RIGHT"][f] > 0)
+            left = torch.tensor(npz[f"masks_{stream}_hand_LEFT"][f] > 0)
+            obj = torch.tensor(npz[f"masks_{stream}_object"][f] > 0)
+            bg = ~(right | left | obj)
+            mask = torch.stack([right, left, obj, bg], dim=0).float()
+            images.append(img)
+            masks.append(mask)
+
+        return (
+            torch.stack(images),   # [S, 3, H, W]
+            torch.stack(masks),    # [S, 4, H, W]
+            clip,
+            stream,
+        )
+
+
+class InterpolationWindowDataset(Dataset):
+    """One sample = a contiguous block of ``2K-1`` stride-sampled frames, split into
+    ``K`` keyframes (even positions) and ``K-1`` held-out targets (odd positions).
+
+    Only the keyframes are ever shown to the model; each odd frame is hidden and must
+    be reconstructed by velocity-transitioning the keyframe Gaussians to the midpoint
+    timestamp between two keyframes. This is the eval the velocity field actually
+    drives (unlike the static, ``use_motion=False`` reconstruction benchmark).
+
+    Note: at inference ``prepare_contexts`` returns early and ``is_target`` is ignored,
+    so we cannot ask the model to split context/target itself — we feed keyframes only
+    and interpolate cameras for the in-between timestamps (see render_interpolated_targets).
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        num_keyframes: int,
+        frame_stride: int,
+        clip_names: set[str] | None,
+        streams: list[str] | None = None,
+    ):
+        assert num_keyframes >= 2, "Need at least 2 keyframes to have an in-between target."
+        self.data_root = Path(data_root)
+        self.K = num_keyframes
+        self.block = 2 * num_keyframes - 1
+        self.streams = streams or STREAMS
+        # (clip, stream, [sampled_frame_idx ...]) of length 2K-1
+        self.windows: list[tuple[str, str, list[int]]] = []
+
+        for npz_path in sorted(self.data_root.glob("clip-*.npz")):
+            clip = npz_path.stem
+            if clip_names is not None and clip not in clip_names:
+                continue
+            npz = np.load(str(npz_path), mmap_mode="r")
+            n_frames = next(
+                npz[k].shape[0] for k in npz.files if k.startswith("images_")
+            )
+            sampled = list(range(0, n_frames, frame_stride))
+            for stream in self.streams:
+                if f"images_{stream}" not in npz.files:
+                    continue
+                # Non-overlapping blocks so a clip's windows stay independent.
+                for i in range(0, len(sampled) - self.block + 1, self.block):
+                    self.windows.append((clip, stream, sampled[i : i + self.block]))
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def _load_frame(self, npz, stream, f):
+        img = torch.tensor(
+            npz[f"images_{stream}"][f], dtype=torch.float32
+        ).permute(2, 0, 1) / 255.0
+        right = torch.tensor(npz[f"masks_{stream}_hand_RIGHT"][f] > 0)
+        left = torch.tensor(npz[f"masks_{stream}_hand_LEFT"][f] > 0)
+        obj = torch.tensor(npz[f"masks_{stream}_object"][f] > 0)
+        bg = ~(right | left | obj)
+        mask = torch.stack([right, left, obj, bg], dim=0).float()
+        return img, mask
+
+    def __getitem__(self, idx: int):
+        clip, stream, block = self.windows[idx]
+        npz = np.load(str(self.data_root / f"{clip}.npz"), mmap_mode="r")
+
+        kf_pos = list(range(0, self.block, 2))   # K keyframes (even)
+        tg_pos = list(range(1, self.block, 2))   # K-1 targets (odd)
+
+        kf_images = torch.stack([self._load_frame(npz, stream, block[p])[0] for p in kf_pos])
+        tgt_pairs = [self._load_frame(npz, stream, block[p]) for p in tg_pos]
+        tgt_images = torch.stack([img for img, _ in tgt_pairs])
+        tgt_masks = torch.stack([mask for _, mask in tgt_pairs])
+
+        return (
+            kf_images,    # [K, 3, H, W]   keyframes the model sees
+            tgt_images,   # [K-1, 3, H, W] hidden in-between frames (GT)
+            tgt_masks,    # [K-1, 4, H, W] GT seg masks for the hidden frames
+            clip,
+            stream,
+        )
+
+
+# ===================================================================== #
+#                              METRICS                                  #
+# ===================================================================== #
+
+
+def confusion_to_metrics(cm: torch.Tensor) -> dict:
+    cm = cm.float()
+    tp = cm.diag()
+    fp = cm.sum(0) - tp
+    fn = cm.sum(1) - tp
+    iou = tp / (tp + fp + fn + 1e-9)
+    acc_per_class = tp / (cm.sum(1) + 1e-9)
+    overall_acc = tp.sum() / (cm.sum() + 1e-9)
+    return {
+        "mIoU": iou.mean().item(),
+        "IoU_per_class": iou.tolist(),
+        "pixel_accuracy": overall_acc.item(),
+        "pixel_accuracy_per_class": acc_per_class.tolist(),
+    }
+
+
+@torch.no_grad()
+def boundary_f1_indices(
+    pred_idx: torch.Tensor,
+    gt_idx: torch.Tensor,
+    num_classes: int,
+    tolerance: int,
+) -> list[float]:
+    """Boundary F1 per class, computed on class-index tensors [N, H, W]."""
+    pred = pred_idx.unsqueeze(1).float()
+    gt = gt_idx.unsqueeze(1).float()
+    k = 2 * tolerance + 1
+    out = []
+    for c in range(num_classes):
+        p_c = (pred == c).float()
+        g_c = (gt == c).float()
+        p_b = (p_c > 0.5) & ((1 - F.max_pool2d(1 - p_c, 3, 1, 1)) < 0.5)
+        g_b = (g_c > 0.5) & ((1 - F.max_pool2d(1 - g_c, 3, 1, 1)) < 0.5)
+        p_dil = F.max_pool2d(p_b.float(), k, 1, tolerance) > 0.5
+        g_dil = F.max_pool2d(g_b.float(), k, 1, tolerance) > 0.5
+        prec = (p_b & g_dil).sum() / (p_b.sum() + 1e-8)
+        rec = (g_b & p_dil).sum() / (g_b.sum() + 1e-8)
+        f1 = 2 * prec * rec / (prec + rec + 1e-8)
+        out.append(f1.item())
+    return out
+
+
+# ===================================================================== #
+#                            EVALUATOR                                  #
+# ===================================================================== #
+
+
+class BenchmarkEvaluator:
+    """Runs the reconstructor over a dataloader and accumulates metrics.
+
+    Segmentation:
+      - Global confusion matrix for mIoU / per-class IoU / pixel accuracy.
+      - Per-(clip, stream) confusion matrix for per-clip rows in the CSV.
+      - BF1 averaged per-window then per-clip.
+
+    Rendering:
+      - Global torchmetrics PSNR/SSIM/LPIPS plus per-clip accumulators.
+    """
+
+    def __init__(
+        self,
+        reconstructor,
+        dataloader,
+        device: str = "cuda",
+        num_classes: int = 4,
+        bf1_tolerance: int = 2,
+        run_seg: bool = True,
+        run_render: bool = True,
+        resolution: tuple[int, int] = (560, 336),
+        seg_source: str = "hand_head",
+    ):
+        self.reconstructor = reconstructor
+        self.dataloader = dataloader
+        self.device = device
+        self.num_classes = num_classes
+        self.bf1_tolerance = bf1_tolerance
+        self.run_seg = run_seg
+        self.run_render = run_render
+        self.res_w, self.res_h = resolution
+        # Where the predicted segmentation comes from:
+        #   "hand_head" — predictions["seg_labels"], the 2D hand_pred_head output.
+        #   "gs_mask"   — argmax of the rasterized per-Gaussian mask logits (gs_head).
+        assert seg_source in ("hand_head", "gs_mask"), seg_source
+        self.seg_source = seg_source
+
+        if run_seg:
+            self.cm = torch.zeros(num_classes, num_classes, dtype=torch.long, device=device)
+            self.per_clip_cm: dict[tuple[str, str], torch.Tensor] = defaultdict(
+                lambda: torch.zeros(num_classes, num_classes, dtype=torch.long, device=device)
+            )
+            self.per_clip_bf1: dict[tuple[str, str], list[list[float]]] = defaultdict(list)
+
+        if run_render:
+            self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
+            self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+            self.lpips_m = LearnedPerceptualImagePatchSimilarity(
+                net_type="vgg", normalize=True
+            ).to(device)
+            # Separate instance for per-window scores so .reset() doesn't
+            # clobber the global accumulator. Sharing the VGG weights would
+            # be nice but torchmetrics doesn't expose that cleanly.
+            self.lpips_window = LearnedPerceptualImagePatchSimilarity(
+                net_type="vgg", normalize=True
+            ).to(device)
+            self.per_clip_render: dict[tuple[str, str], dict] = defaultdict(
+                lambda: {"psnr": [], "ssim": [], "lpips": []}
+            )
+
+        # Majority-class baseline (segmentation): pixel-frequency over GT.
+        self.gt_pixel_counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+
+    @torch.no_grad()
+    def _render_mask_logits(self, predictions) -> torch.Tensor:
+        """Rasterize the per-Gaussian mask logits at the input cameras → [S, C, H, W].
+
+        Mirrors the rendering path but keeps the rasterizer's 4th output (the mask
+        channels added by the segmentation-aware gs_head) instead of the RGB colors.
+        """
+        gaussians = predictions["splats"]
+        input_c2w = predictions["rendered_extrinsics"][0]
+        input_intrs = predictions["rendered_intrinsics"][0]
+        input_ts = predictions["rendered_timestamps"][0]
+        input_w2c = homo_matrix_inverse(input_c2w)
+
+        _, _, _, masks = self.reconstructor.gs_renderer.rasterizer.forward(
+            gaussians,
+            render_viewmats=[input_w2c],
+            render_Ks=[input_intrs],
+            render_timestamps=[input_ts],
+            sh_degree=0,
+            width=self.res_w,
+            height=self.res_h,
+            render_classes=[0, 1, 2, 3],
+        )
+        if masks is None:
+            raise RuntimeError(
+                "Rasterizer returned no mask logits — the loaded gs_head has no mask "
+                "channels. Check --gs-mask-head-path points to a gs_mask checkpoint."
+            )
+        # masks: [1, S, H, W, C] → [S, C, H, W]
+        return masks[0].permute(0, 3, 1, 2).float()
+
+    @torch.no_grad()
+    def _step(
+        self,
+        images_seq: torch.Tensor,   # [1, S, 3, H, W]
+        gt_mask: torch.Tensor,      # [S, 4, H, W]
+        clip: str,
+        stream: str,
+    ):
+        B, S = images_seq.shape[:2]
+        views = {
+            "img": images_seq,
+            "is_target": torch.zeros((B, S), dtype=torch.bool, device=self.device),
+            "is_static": torch.zeros((B, S), dtype=torch.bool, device=self.device),
+            "timestamp": torch.arange(S, dtype=torch.int64, device=self.device)
+            .unsqueeze(0)
+            .expand(B, -1),
+        }
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            predictions = self.reconstructor(views, is_inference=True, use_motion=False)
+
+        key = (clip, stream)
+
+        if self.run_seg:
+            if self.seg_source == "hand_head":
+                # predictions["seg_labels"]: [B, S, H, W, C] channels-last
+                cls = predictions["seg_labels"][0]                # [S, H, W, C]
+                pred_logits = cls.permute(0, 3, 1, 2).float()     # [S, C, H, W]
+            else:
+                # gs_mask: rasterize the per-Gaussian mask logits at the input cameras.
+                pred_logits = self._render_mask_logits(predictions)  # [S, C, H, W]
+            pred_idx = pred_logits.argmax(dim=1)              # [S, H, W]
+            gt_idx = gt_mask.argmax(dim=1)                    # [S, H, W]
+
+            k = self.num_classes
+            flat = gt_idx.reshape(-1) * k + pred_idx.reshape(-1)
+            cm_step = torch.bincount(flat, minlength=k * k).reshape(k, k)
+            self.cm += cm_step
+            self.per_clip_cm[key] += cm_step
+
+            self.gt_pixel_counts += torch.bincount(
+                gt_idx.reshape(-1), minlength=k
+            )
+
+            bf1 = boundary_f1_indices(pred_idx, gt_idx, k, self.bf1_tolerance)
+            self.per_clip_bf1[key].append(bf1)
+
+        if self.run_render:
+            gaussians = predictions["splats"]
+            input_c2w = predictions["rendered_extrinsics"][0]
+            input_intrs = predictions["rendered_intrinsics"][0]
+            input_ts = predictions["rendered_timestamps"][0]
+            input_w2c = homo_matrix_inverse(input_c2w)
+
+            # rasterizer.forward returns (colors, depths, alphas, masks); the mask channel
+            # was added with the segmentation-aware gs_head extension. We only need colors.
+            target_rgb, _, _, _ = self.reconstructor.gs_renderer.rasterizer.forward(
+                gaussians,
+                render_viewmats=[input_w2c],
+                render_Ks=[input_intrs],
+                render_timestamps=[input_ts],
+                sh_degree=0,
+                width=self.res_w,
+                height=self.res_h,
+                render_classes=[0, 1, 2, 3]
+            )
+            # target_rgb: [1, S, H, W, 3] in [0, 1]
+            pred_rgb = target_rgb[0].permute(0, 3, 1, 2).clamp(0, 1).float()
+            gt_rgb = images_seq[0].float()
+
+            self.psnr.update(pred_rgb, gt_rgb)
+            self.ssim.update(pred_rgb, gt_rgb)
+            # torchmetrics LPIPS with normalize=True expects inputs in [0, 1].
+            self.lpips_m.update(pred_rgb, gt_rgb)
+
+            # Per-clip — recompute against window only.
+            psnr_w = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+            ssim_w = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+            psnr_w.update(pred_rgb, gt_rgb)
+            ssim_w.update(pred_rgb, gt_rgb)
+            self.per_clip_render[key]["psnr"].append(psnr_w.compute().item())
+            self.per_clip_render[key]["ssim"].append(ssim_w.compute().item())
+            self.lpips_window.reset()
+            self.lpips_window.update(pred_rgb, gt_rgb)
+            self.per_clip_render[key]["lpips"].append(self.lpips_window.compute().item())
+
+    @torch.no_grad()
+    def eval(self):
+        t0 = time.time()
+        n_windows = 0
+        for batch in self.dataloader:
+            images, gt_mask, clip, stream = batch
+            # batch_size=1 → strip the batch dim from the per-window tensors,
+            # but keep [1, S, ...] for the reconstructor.
+            images = images.to(self.device, non_blocking=True)        # [1, S, 3, H, W]
+            gt_mask = gt_mask.to(self.device, non_blocking=True)[0]   # [S, 4, H, W]
+            clip = clip[0] if isinstance(clip, (list, tuple)) else clip
+            stream = stream[0] if isinstance(stream, (list, tuple)) else stream
+            self._step(images, gt_mask, clip, stream)
+            n_windows += 1
+            if n_windows % 20 == 0:
+                print(
+                    f"  [{n_windows} windows, {time.time()-t0:.0f}s elapsed]",
+                    flush=True,
+                )
+        print(f"Eval done: {n_windows} windows in {time.time()-t0:.0f}s", flush=True)
+        return self.compute()
+
+    def compute(self) -> dict:
+        out: dict = {"per_clip": {}, "aggregate": {}, "baselines": {}}
+
+        if self.run_seg:
+            global_seg = confusion_to_metrics(self.cm.cpu())
+            out["aggregate"].update({
+                "mIoU": global_seg["mIoU"],
+                "IoU_per_class": dict(zip(CLASS_NAMES, global_seg["IoU_per_class"])),
+                "pixel_accuracy": global_seg["pixel_accuracy"],
+                "pixel_accuracy_per_class": dict(
+                    zip(CLASS_NAMES, global_seg["pixel_accuracy_per_class"])
+                ),
+            })
+
+            # Majority-class baseline: predict the most frequent class for every pixel.
+            freqs = self.gt_pixel_counts.float().cpu()
+            total = freqs.sum().clamp(min=1)
+            majority = int(freqs.argmax().item())
+            maj_iou = (freqs[majority] / total).item()  # IoU = freq, others = 0
+            out["baselines"]["majority_class"] = CLASS_NAMES[majority]
+            out["baselines"]["majority_class_mIoU"] = maj_iou / self.num_classes
+            out["baselines"]["majority_class_pixel_accuracy"] = (
+                freqs[majority] / total
+            ).item()
+
+            # Per-(clip,stream) seg rows.
+            for key, cm in self.per_clip_cm.items():
+                row = confusion_to_metrics(cm.cpu())
+                bf1s = np.array(self.per_clip_bf1[key])  # [n_windows, C]
+                row["bf1"] = float(bf1s.mean())
+                row["bf1_per_class"] = bf1s.mean(axis=0).tolist()
+                out["per_clip"].setdefault(f"{key[0]}::{key[1]}", {}).update(row)
+
+            # Mean BF1 across clips.
+            all_bf1 = [r["bf1"] for r in out["per_clip"].values() if "bf1" in r]
+            if all_bf1:
+                out["aggregate"]["boundary_f1"] = float(np.mean(all_bf1))
+
+            out["aggregate"]["confusion_matrix"] = self.cm.cpu().tolist()
+
+        if self.run_render:
+            out["aggregate"]["PSNR"] = self.psnr.compute().item()
+            out["aggregate"]["SSIM"] = self.ssim.compute().item()
+            out["aggregate"]["LPIPS"] = self.lpips_m.compute().item()
+
+            # Per-clip rendering: mean across the clip's windows.
+            for key, d in self.per_clip_render.items():
+                row = out["per_clip"].setdefault(f"{key[0]}::{key[1]}", {})
+                row["PSNR"] = float(np.mean(d["psnr"]))
+                row["SSIM"] = float(np.mean(d["ssim"]))
+                row["LPIPS"] = float(np.mean(d["lpips"]))
+
+            # Macro-mean across clips (complements the torchmetrics global).
+            clip_psnr = [
+                r["PSNR"] for r in out["per_clip"].values() if "PSNR" in r
+            ]
+            clip_ssim = [
+                r["SSIM"] for r in out["per_clip"].values() if "SSIM" in r
+            ]
+            clip_lpips = [
+                r["LPIPS"] for r in out["per_clip"].values() if "LPIPS" in r
+            ]
+            if clip_psnr:
+                out["aggregate"]["PSNR_macro"] = float(np.mean(clip_psnr))
+                out["aggregate"]["PSNR_macro_std"] = float(np.std(clip_psnr))
+            if clip_ssim:
+                out["aggregate"]["SSIM_macro"] = float(np.mean(clip_ssim))
+                out["aggregate"]["SSIM_macro_std"] = float(np.std(clip_ssim))
+            if clip_lpips:
+                out["aggregate"]["LPIPS_macro"] = float(np.mean(clip_lpips))
+                out["aggregate"]["LPIPS_macro_std"] = float(np.std(clip_lpips))
+
+        return out
+
+
+class InterpolationEvaluator:
+    """Keyframe-interpolation benchmark.
+
+    For each window the model receives only the keyframes and renders the held-out
+    in-between frames by velocity-transitioning the keyframe Gaussians to the
+    targets' mid-interval timestamps (``use_motion=True, is_inference=True``). We
+    score the rendered targets against their real GT frames.
+
+    Metrics (all on target/in-between frames only):
+      - PSNR / SSIM / LPIPS over the full frame.
+      - Region-split PSNR for foreground (hands+object) vs background, using the GT
+        masks. Background PSNR is the most sensitive signal for velocity
+        regularization, since that loss only touches background Gaussians.
+    """
+
+    def __init__(
+        self,
+        reconstructor,
+        dataloader,
+        device: str = "cuda",
+        num_classes: int = 4,
+        resolution: tuple[int, int] = (560, 336),
+    ):
+        self.reconstructor = reconstructor
+        self.dataloader = dataloader
+        self.device = device
+        self.num_classes = num_classes
+        self.res_w, self.res_h = resolution
+
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        self.lpips_m = LearnedPerceptualImagePatchSimilarity(
+            net_type="vgg", normalize=True
+        ).to(device)
+
+        # Global region-split accumulators (sum of squared error + pixel*channel counts),
+        # so the reported PSNR is over all target pixels rather than a mean of per-frame PSNRs.
+        self.sse = {"all": 0.0, "fg": 0.0, "bg": 0.0}
+        self.cnt = {"all": 0.0, "fg": 0.0, "bg": 0.0}
+
+        self.per_clip: dict[tuple[str, str], dict] = defaultdict(
+            lambda: {"psnr": [], "ssim": [], "lpips": [], "psnr_fg": [], "psnr_bg": []}
+        )
+        self._warned_no_velocity = False
+
+    @staticmethod
+    def _masked_psnr(se: torch.Tensor, mask: torch.Tensor) -> float:
+        """se: [V,3,H,W] squared error; mask: [V,1,H,W] in {0,1}. PSNR over masked pixels."""
+        m = mask.expand_as(se)
+        denom = m.sum()
+        if denom <= 0:
+            return float("nan")
+        mse = (se * m).sum() / denom
+        return 99.0 if mse.item() == 0 else -10.0 * math.log10(mse.item())
+
+    @torch.no_grad()
+    def _step(self, kf_images, tgt_images, tgt_masks, clip, stream):
+        # kf_images [1, K, 3, H, W]; tgt_images [1, K-1, 3, H, W]; tgt_masks [1, K-1, 4, H, W].
+        pred, has_velocity = render_interpolated_targets(
+            self.reconstructor, kf_images, self.device, self.res_w, self.res_h
+        )  # [V, 3, h, w] on device
+
+        if not has_velocity and not self._warned_no_velocity:
+            print(
+                "  WARNING: predictions has no 'velocity_fwd' — motion did not engage, so the "
+                "in-between frames are rendered statically and this benchmark cannot see the "
+                "velocity field. Check that the model has enable_motion and that use_motion=True.",
+                flush=True,
+            )
+            self._warned_no_velocity = True
+
+        gt = tgt_images[0].float()                                   # [V, 3, H, W]
+        masks = tgt_masks[0].float()                                 # [V, 4, H, W]
+        if pred.shape[-2:] != gt.shape[-2:]:
+            gt = F.interpolate(gt, size=pred.shape[-2:], mode="bilinear", align_corners=False)
+            masks = F.interpolate(masks, size=pred.shape[-2:], mode="nearest")
+        pred, gt, tgt_masks = pred.to(self.device), gt.to(self.device), masks.to(self.device)
+
+        # Global full-frame metrics.
+        self.psnr.update(pred, gt)
+        self.ssim.update(pred, gt)
+        self.lpips_m.update(pred, gt)
+
+        # Region-split squared error (channel 3 = background).
+        bg = (tgt_masks[:, 3:4] > 0.5).float()    # [V, 1, h, w]
+        fg = 1.0 - bg
+        se = (pred - gt) ** 2                      # [V, 3, h, w]
+        self.sse["all"] += se.sum().item();          self.cnt["all"] += float(se.numel())
+        self.sse["bg"] += (se * bg).sum().item();     self.cnt["bg"] += bg.expand_as(se).sum().item()
+        self.sse["fg"] += (se * fg).sum().item();     self.cnt["fg"] += fg.expand_as(se).sum().item()
+
+        # Per-(clip, stream) rows.
+        psnr_w = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        ssim_w = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        psnr_w.update(pred, gt)
+        ssim_w.update(pred, gt)
+        key = (clip, stream)
+        self.per_clip[key]["psnr"].append(psnr_w.compute().item())
+        self.per_clip[key]["ssim"].append(ssim_w.compute().item())
+        self.per_clip[key]["psnr_fg"].append(self._masked_psnr(se, fg))
+        self.per_clip[key]["psnr_bg"].append(self._masked_psnr(se, bg))
+
+    @torch.no_grad()
+    def eval(self):
+        t0 = time.time()
+        n = 0
+        for kf_images, tgt_images, tgt_masks, clip, stream in self.dataloader:
+            clip = clip[0] if isinstance(clip, (list, tuple)) else clip
+            stream = stream[0] if isinstance(stream, (list, tuple)) else stream
+            self._step(kf_images, tgt_images, tgt_masks, clip, stream)
+            n += 1
+            if n % 20 == 0:
+                print(f"  [{n} interp windows, {time.time()-t0:.0f}s elapsed]", flush=True)
+        print(f"Interpolation eval done: {n} windows in {time.time()-t0:.0f}s", flush=True)
+        return self.compute()
+
+    def compute(self) -> dict:
+        out: dict = {"per_clip": {}, "aggregate": {}, "baselines": {}}
+
+        out["aggregate"]["PSNR"] = self.psnr.compute().item()
+        out["aggregate"]["SSIM"] = self.ssim.compute().item()
+        out["aggregate"]["LPIPS"] = self.lpips_m.compute().item()
+
+        def global_psnr(tag):
+            if self.cnt[tag] <= 0:
+                return float("nan")
+            mse = self.sse[tag] / self.cnt[tag]
+            return 99.0 if mse == 0 else -10.0 * math.log10(mse)
+
+        out["aggregate"]["PSNR_pixelwise"] = global_psnr("all")
+        out["aggregate"]["PSNR_foreground"] = global_psnr("fg")
+        out["aggregate"]["PSNR_background"] = global_psnr("bg")
+
+        def nanmean(xs):
+            xs = [x for x in xs if x == x]  # drop NaN (windows with no fg/bg pixels)
+            return float(np.mean(xs)) if xs else float("nan")
+
+        for key, d in self.per_clip.items():
+            row = out["per_clip"].setdefault(f"{key[0]}::{key[1]}", {})
+            row["PSNR"] = float(np.mean(d["psnr"]))
+            row["SSIM"] = float(np.mean(d["ssim"]))
+            row["LPIPS"] = float(np.mean(d["lpips"]))
+            row["PSNR_fg"] = nanmean(d["psnr_fg"])
+            row["PSNR_bg"] = nanmean(d["psnr_bg"])
+
+        for col in ("PSNR", "SSIM", "LPIPS", "PSNR_fg", "PSNR_bg"):
+            vals = [r[col] for r in out["per_clip"].values() if col in r and r[col] == r[col]]
+            if vals:
+                out["aggregate"][f"{col}_macro"] = float(np.mean(vals))
+                out["aggregate"][f"{col}_macro_std"] = float(np.std(vals))
+
+        return out
+
+
+# ===================================================================== #
+#                                 CLI                                   #
+# ===================================================================== #
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="NeoVerse reconstructor benchmark.")
+
+    p.add_argument("--mode", type=str, default="seg_compare",
+                   choices=["interpolation", "reconstruction", "both", "seg_compare"],
+                   help="seg_compare (default): compare the two segmentation models — the "
+                        "hand_pred_head (2D seg_labels) vs the gs_mask gs_head (rasterized mask "
+                        "channels) — on a shared base reconstructor, with the same seg metrics. "
+                        "interpolation: render held-out in-between frames via velocity. "
+                        "reconstruction: the static use_motion=False keyframe re-render + seg. "
+                        "both: interpolation + reconstruction.")
+    p.add_argument("--num-keyframes", type=int, default=3,
+                   help="K for interpolation windows: each window is 2K-1 frames "
+                        "(K keyframes + K-1 in-between targets).")
+
+    p.add_argument("--data-root", type=str, default="/work/courses/3dv/team32/training_data_modal",
+                   help="Must match training_25_04.py to keep the val split consistent.")
+    p.add_argument("--val-fraction", type=float, default=0.1)
+    p.add_argument("--frame-stride", type=int, default=3)
+    p.add_argument("--window-size", type=int, default=6,
+                   help="Frames per reconstructor call (S). Matches the demo's default.")
+    p.add_argument("--img-shape", type=int, nargs=2, default=(280, 280),
+                   help="(H, W). Resolution for the rasterizer is taken from this.")
+    p.add_argument("--num-classes", type=int, default=4)
+
+    p.add_argument("--device", type=str,
+                   default="cuda" if torch.cuda.is_available() else "cpu")
+
+    p.add_argument("--reconstruction-model-path", type=str,
+                   default="models/NeoVerse/reconstructor.ckpt",
+                   help="Base reconstructor backbone shared by both segmentation models.")
+    p.add_argument("--hand-head-path", type=str,
+                   default="models/NeoVerse/hand_seg_model_opt_best.ckpt",
+                   help="hand_seg model: hand_pred_head weights (2D seg_labels). "
+                        "Loaded on top of the base reconstructor.")
+    p.add_argument("--gs-mask-head-path", type=str,
+                   default="models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt",
+                   help="gs_mask model: gs_head/gs_head_dynamic weights whose rasterized mask "
+                        "channels are the segmentation. Loaded on top of the base reconstructor.")
+    p.add_argument("--label-a", type=str, default="hand_seg",
+                   help="Label for the hand_pred_head segmentation model in comparison output.")
+    p.add_argument("--label-b", type=str, default="gs_mask",
+                   help="Label for the gs_mask (rendered-mask) segmentation model in comparison output.")
+
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--pin-memory", action="store_true", default=True)
+
+    p.add_argument("--run-seg", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--run-render", action=argparse.BooleanOptionalAction, default=True)
+
+    p.add_argument("--output-dir", type=str, default="logs/benchmark_logs")
+    p.add_argument("--run-id", type=str,
+                   default=datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+    return p.parse_args()
+
+
+def _is_wrapped_training_ckpt(path: str) -> bool:
+    """True if `path` is a training checkpoint that wraps weights under model_state_dict."""
+    raw = torch.load(path, map_location="cpu", weights_only=False)
+    return isinstance(raw, dict) and "model_state_dict" in raw
+
+
+def load_reconstructor(args, ckpt_path: str | None = None):
+    # ``ckpt_path`` overrides args.reconstruction_model_path so a single args object can
+    # drive two checkpoints in a comparison run; everything else (hand head, device) is shared.
+    ckpt_path = ckpt_path or args.reconstruction_model_path
+
+    # Fail fast on a broken/absent GPU. The model runs in bf16 and the Gaussian-splat
+    # rasterizer is CUDA-only, so a CPU fallback (args.device=="cpu" because
+    # torch.cuda.is_available() returned False) doesn't just run slowly — it crashes deep
+    # in the forward pass with a confusing "Input type (float) and bias type (BFloat16)"
+    # error, because CUDA autocast is inert on CPU tensors.
+    if not str(args.device).startswith("cuda"):
+        raise RuntimeError(
+            f"--device is '{args.device}', not CUDA. This usually means torch.cuda.is_available() "
+            "returned False (e.g. a driver/runtime mismatch on this node — check `nvidia-smi` and "
+            "your CUDA module). The reconstructor needs a working GPU; aborting before the model "
+            "loads. Run `python -c \"import torch; print(torch.cuda.is_available())\"` to confirm."
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"--device is '{args.device}' but torch.cuda.is_available() is False. The GPU/driver is "
+            "not usable on this node (see any NVML / 'forward compatibility' warnings above). "
+            "Switch to a working GPU node before running the benchmark."
+        )
+
+    print(f"Loading reconstructor from {ckpt_path} ...", flush=True)
+
+    # Two kinds of reconstructor checkpoints:
+    #
+    #  - Original `reconstructor.ckpt`: a flat state_dict whose key-hash is registered in
+    #    WorldMirror.from_civitai. ModelManager auto-detects it and builds the model with
+    #    enable_norm=False. (Its gs_head has 12 channels — the pre-extension model.)
+    #
+    #  - Fine-tuned checkpoints (e.g. the gs_head extension / velocity_regularization): saved
+    #    as {"model_state_dict": ..., ...}. ModelManager can't auto-detect them — it hashes the
+    #    top-level (metadata) keys, and even unwrapped the fine-tuned key set isn't registered,
+    #    so from_civitai returns no kwargs and the default head dims are wrong.
+    #
+    # The current code builds the EXTENDED architecture (gs_head with 16 channels: the 4 extra
+    # mask-class logits, see GaussianSplatRenderer.num_mask_classes). So for a fine-tuned
+    # checkpoint we construct WorldMirror(enable_norm=False) directly — matching how the original
+    # is built, but with today's 16-channel head — and load the weights with strict=False.
+    if _is_wrapped_training_ckpt(ckpt_path):
+        print("    Detected fine-tuned checkpoint; building WorldMirror(enable_norm=False) "
+              "with the extended 16-channel gs_head.", flush=True)
+        reconstructor = WorldMirror(enable_norm=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        sd = ckpt["model_state_dict"]
+        missing, unexpected = reconstructor.load_state_dict(sd, strict=False)
+        reconstructor = reconstructor.to(device=args.device, dtype=torch.bfloat16)
+        print(f"    Loaded fine-tuned weights: {len(sd)} tensors, "
+              f"{len(missing)} missing, {len(unexpected)} unexpected.", flush=True)
+        if unexpected:
+            print(f"    WARNING: {len(unexpected)} unexpected keys, e.g. {unexpected[:5]}", flush=True)
+        if missing:
+            print(f"    WARNING: {len(missing)} missing keys, e.g. {missing[:5]}", flush=True)
+    else:
+        mm = ModelManager(device=args.device, torch_dtype=torch.bfloat16)
+        mm.load_model(ckpt_path, device=args.device, torch_dtype=torch.bfloat16)
+        reconstructor: WorldMirror = mm.fetch_model("reconstructor")
+        if reconstructor is None:
+            raise RuntimeError(
+                f"ModelManager could not load a reconstructor from {ckpt_path}."
+            )
+
+    print(f"Loading hand head from {args.hand_head_path} ...", flush=True)
+    ckpt = torch.load(args.hand_head_path, map_location="cpu")
+    sd = ckpt.get("model_state_dict", ckpt)
+    if not any(k.startswith("hand_pred_head.") for k in sd.keys()):
+        sd = {f"hand_pred_head.{k}": v for k, v in sd.items()}
+    else:
+        sd = {k: v for k, v in sd.items() if k.startswith("hand_pred_head.")}
+    missing, unexpected = reconstructor.load_state_dict(sd, strict=False)
+    head_keys = [k for k in missing if "hand_pred_head" in k]
+    if head_keys:
+        print(f"WARNING: {len(head_keys)} hand_pred_head keys missing from ckpt", flush=True)
+
+    # fp32 head — matches training_25_04.py
+    reconstructor.hand_pred_head.float()
+    reconstructor.to(args.device).eval()
+    return reconstructor
+
+
+def load_gs_mask_head(reconstructor, path: str, device: str):
+    """Overlay the gs_mask model's gs_head / gs_head_dynamic onto a base reconstructor.
+
+    The gs_mask checkpoint (training_gs_mask.save_checkpoint) wraps a *nested*
+    model_state_dict: {"gs_head": <sd>, "gs_head_dynamic": <sd>} — only the
+    mask-aware Gaussian head, not a full reconstructor. We load those submodules
+    in place; the rasterized mask channels then carry this head's class logits.
+    """
+    print(f"Loading gs_mask head from {path} ...", flush=True)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    params = ckpt.get("model_state_dict", ckpt)
+    if "gs_head" not in params:
+        raise RuntimeError(
+            f"{path} has no 'gs_head' in its model_state_dict (keys: {list(params)[:8]}). "
+            "Expected a gs_mask checkpoint from training_gs_mask.py."
+        )
+
+    gsr = reconstructor.gs_renderer
+    missing, unexpected = gsr.gs_head.load_state_dict(params["gs_head"], strict=False)
+    print(f"    gs_head: {len(missing)} missing, {len(unexpected)} unexpected", flush=True)
+    if missing or unexpected:
+        print(f"    WARNING: gs_head load not clean — e.g. missing={missing[:3]} "
+              f"unexpected={unexpected[:3]}", flush=True)
+    if "gs_head_dynamic" in params and hasattr(gsr, "gs_head_dynamic"):
+        m2, u2 = gsr.gs_head_dynamic.load_state_dict(params["gs_head_dynamic"], strict=False)
+        print(f"    gs_head_dynamic: {len(m2)} missing, {len(u2)} unexpected", flush=True)
+
+    # fp32 head — matches training_gs_mask.py
+    gsr.gs_head.float()
+    if hasattr(gsr, "gs_head_dynamic"):
+        gsr.gs_head_dynamic.float()
+    reconstructor.to(device).eval()
+    return reconstructor
+
+
+def write_outputs(results: dict, args, out_dir: Path, tag: str = ""):
+    """Write config/aggregate/baselines/per_clip. ``tag`` (e.g. 'interpolation')
+    suffixes the per-mode files so several modes can share one run dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sfx = f"_{tag}" if tag else ""
+
+    with open(out_dir / "config.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    with open(out_dir / f"aggregate{sfx}.json", "w") as f:
+        json.dump(results["aggregate"], f, indent=2)
+
+    if results.get("baselines"):
+        with open(out_dir / f"baselines{sfx}.json", "w") as f:
+            json.dump(results["baselines"], f, indent=2)
+
+    per_clip = results["per_clip"]
+    if per_clip:
+        # Stable column order: derive from the first row's keys, then sort scalars first.
+        all_keys = set()
+        for row in per_clip.values():
+            all_keys.update(row.keys())
+        scalar_keys = sorted(
+            k for k in all_keys
+            if not isinstance(next(iter(per_clip.values())).get(k, None), list)
+        )
+        list_keys = sorted(k for k in all_keys if k not in scalar_keys)
+        columns = ["clip_stream", *scalar_keys, *list_keys]
+
+        with open(out_dir / f"per_clip{sfx}.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(columns)
+            for name, row in sorted(per_clip.items()):
+                vals = [name]
+                for k in scalar_keys:
+                    v = row.get(k, "")
+                    vals.append(f"{v:.6f}" if isinstance(v, float) else v)
+                for k in list_keys:
+                    vals.append(json.dumps(row.get(k, [])))
+                w.writerow(vals)
+
+
+def _make_loader(dataset, args):
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=(args.num_workers > 0),
+    )
+
+
+def run_interpolation(reconstructor, args, val_clips, out_dir):
+    dataset = InterpolationWindowDataset(
+        data_root=args.data_root,
+        num_keyframes=args.num_keyframes,
+        frame_stride=args.frame_stride,
+        clip_names=val_clips,
+    )
+    print(f"Interpolation windows: {len(dataset)} "
+          f"(num_keyframes={args.num_keyframes} -> {2*args.num_keyframes-1} frames/window, "
+          f"frame_stride={args.frame_stride})", flush=True)
+    if len(dataset) == 0:
+        raise RuntimeError(
+            "No interpolation windows built — clips may be shorter than "
+            f"{2*args.num_keyframes-1} stride-sampled frames. Lower --num-keyframes or --frame-stride."
+        )
+
+    H, W = args.img_shape
+    evaluator = InterpolationEvaluator(
+        reconstructor, _make_loader(dataset, args),
+        device=args.device, num_classes=args.num_classes, resolution=(W, H),
+    )
+    results = evaluator.eval()
+    write_outputs(results, args, out_dir, tag="interpolation")
+    print("\n=== Interpolation (held-out in-between frames) ===")
+    print(json.dumps(results["aggregate"], indent=2))
+    return results
+
+
+def run_reconstruction(reconstructor, args, val_clips, out_dir):
+    dataset = ClipWindowDataset(
+        data_root=args.data_root,
+        window_size=args.window_size,
+        frame_stride=args.frame_stride,
+        clip_names=val_clips,
+    )
+    print(f"Reconstruction windows: {len(dataset)} (window_size={args.window_size}, "
+          f"frame_stride={args.frame_stride})", flush=True)
+    if len(dataset) == 0:
+        raise RuntimeError("No windows built — check data_root and val_fraction.")
+
+    H, W = args.img_shape
+    evaluator = BenchmarkEvaluator(
+        reconstructor, _make_loader(dataset, args),
+        device=args.device, num_classes=args.num_classes,
+        run_seg=args.run_seg, run_render=args.run_render, resolution=(W, H),
+    )
+    results = evaluator.eval()
+    write_outputs(results, args, out_dir, tag="reconstruction")
+    print("\n=== Reconstruction (static keyframe re-render) ===")
+    print(json.dumps(results["aggregate"], indent=2))
+    print("\n=== Baselines ===")
+    print(json.dumps(results["baselines"], indent=2))
+    return results
+
+
+def _run_seg(reconstructor, args, dataset, seg_source, out_dir, label):
+    """Run the segmentation-only benchmark for one model and write its outputs."""
+    H, W = args.img_shape
+    evaluator = BenchmarkEvaluator(
+        reconstructor, _make_loader(dataset, args),
+        device=args.device, num_classes=args.num_classes,
+        run_seg=True, run_render=False, resolution=(W, H), seg_source=seg_source,
+    )
+    results = evaluator.eval()
+    write_outputs(results, args, out_dir, tag=label)
+    print(f"\n=== Segmentation [{label}] (seg_source={seg_source}) ===")
+    print(json.dumps(results["aggregate"], indent=2))
+    return results
+
+
+def run_seg_compare(args, val_clips, out_dir):
+    """Compare the two segmentation models on a shared base reconstructor.
+
+      - label_a (hand_seg): base reconstructor + hand_pred_head → predictions["seg_labels"].
+      - label_b (gs_mask):  same reconstructor + gs_mask gs_head → rasterized mask channels.
+
+    Both score the same seg metrics on the same val windows. The gs_mask head is
+    overlaid in place after the hand_seg pass — it doesn't touch hand_pred_head, and
+    the gs_mask pass reads only the rendered masks, so the two passes don't interfere.
+    """
+    dataset = ClipWindowDataset(
+        data_root=args.data_root, window_size=args.window_size,
+        frame_stride=args.frame_stride, clip_names=val_clips,
+    )
+    print(f"Segmentation windows: {len(dataset)} (window_size={args.window_size}, "
+          f"frame_stride={args.frame_stride})", flush=True)
+    if len(dataset) == 0:
+        raise RuntimeError("No windows built — check data_root and val_fraction.")
+
+    reconstructor = load_reconstructor(args)  # base reconstructor + hand_pred_head
+    res_a = _run_seg(reconstructor, args, dataset, "hand_head", out_dir, args.label_a)
+
+    load_gs_mask_head(reconstructor, args.gs_mask_head_path, args.device)
+    res_b = _run_seg(reconstructor, args, dataset, "gs_mask", out_dir, args.label_b)
+
+    ckpt_paths = {
+        args.label_a: f"{args.reconstruction_model_path} + {args.hand_head_path}",
+        args.label_b: f"{args.reconstruction_model_path} + {args.gs_mask_head_path}",
+    }
+    write_comparison(
+        {"segmentation": res_a}, {"segmentation": res_b}, args, out_dir, ckpt_paths,
+    )
+
+
+def _scalar_aggregate(agg: dict) -> dict:
+    """Flatten the aggregate into scalar metrics for diffing.
+
+    Scalars pass through; nested dicts of scalars (e.g. IoU_per_class,
+    pixel_accuracy_per_class) are flattened to ``parent.child`` keys; lists
+    (e.g. confusion_matrix) are dropped.
+    """
+    out: dict = {}
+    for k, v in agg.items():
+        if isinstance(v, (int, float)):
+            out[k] = v
+        elif isinstance(v, dict):
+            for ck, cv in v.items():
+                if isinstance(cv, (int, float)):
+                    out[f"{k}.{ck}"] = cv
+    return out
+
+
+def write_comparison(results_a, results_b, args, out_dir: Path, ckpt_paths: dict):
+    """Side-by-side A/B aggregate metrics with B - A deltas, per mode.
+
+    ``results_a``/``results_b`` are {mode: results}. ``ckpt_paths`` maps each label
+    to the checkpoint it identifies. Writes comparison.json and, per mode, a
+    comparison_<mode>.csv with one row per metric.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    la, lb = args.label_a, args.label_b
+    comparison: dict = {
+        "checkpoints": ckpt_paths,
+        "modes": {},
+    }
+
+    for mode in sorted(set(results_a) & set(results_b)):
+        agg_a = _scalar_aggregate(results_a[mode]["aggregate"])
+        agg_b = _scalar_aggregate(results_b[mode]["aggregate"])
+        rows = {}
+        for metric in sorted(set(agg_a) | set(agg_b)):
+            va, vb = agg_a.get(metric), agg_b.get(metric)
+            delta = (vb - va) if (va is not None and vb is not None) else None
+            rows[metric] = {la: va, lb: vb, "delta": delta}
+        comparison["modes"][mode] = rows
+
+        with open(out_dir / f"comparison_{mode}.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["metric", la, lb, f"delta ({lb}-{la})"])
+            for metric, r in rows.items():
+                fmt = lambda v: f"{v:.6f}" if isinstance(v, float) else ("" if v is None else v)
+                w.writerow([metric, fmt(r[la]), fmt(r[lb]), fmt(r["delta"])])
+
+    with open(out_dir / "comparison.json", "w") as f:
+        json.dump(comparison, f, indent=2)
+
+    # Console summary.
+    print("\n" + "=" * 60)
+    print(f"COMPARISON  {lb} - {la}")
+    print("=" * 60)
+    for mode, rows in comparison["modes"].items():
+        print(f"\n[{mode}]")
+        print(f"  {'metric':<24}{la:>14}{lb:>14}{'delta':>14}")
+        for metric, r in rows.items():
+            fmt = lambda v: f"{v:>14.6f}" if isinstance(v, float) else f"{str(v):>14}"
+            print(f"  {metric:<24}{fmt(r[la])}{fmt(r[lb])}{fmt(r['delta'])}")
+    return comparison
+
+
+def main():
+    args = parse_args()
+
+    val_clips = get_val_clips(args.data_root, args.val_fraction)
+    print(f"Mode: {args.mode} | Val clips: {len(val_clips)} (data_root={args.data_root})", flush=True)
+
+    out_dir = Path(args.output_dir) / args.run_id
+
+    if args.mode == "seg_compare":
+        run_seg_compare(args, val_clips, out_dir)
+        print(f"\nWrote outputs to {out_dir}")
+        return
+
+    # Single-model modes (interpolation / reconstruction / both).
+    reconstructor = load_reconstructor(args)
+    if args.mode in ("interpolation", "both"):
+        run_interpolation(reconstructor, args, val_clips, out_dir)
+    if args.mode in ("reconstruction", "both"):
+        run_reconstruction(reconstructor, args, val_clips, out_dir)
+    print(f"\nWrote outputs to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()

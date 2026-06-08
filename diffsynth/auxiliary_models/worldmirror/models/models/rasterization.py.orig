@@ -606,17 +606,7 @@ class GaussianSplatRenderer(nn.Module):
                 )
                 scale_factor = scale_factor.unsqueeze(-1)
 
-            # Rescale the translation (x,y,z of the last column) of each 4x4 extrinsic by
-            # scale_factor, rebuilt FULLY functionally (no in-place index assignment).
-            # Numerically identical to the previous `[..., :3, 3] = ... * scale_factor`,
-            # but the in-place form reads & writes the same storage, which invalidates the
-            # slice autograd needs once upstream params require grad (e.g. #4 unfreeze).
-            rot_cols = pred_all_extrinsic[..., :, :3]            # [B, S, 4, 3] cols 0..2
-            last_col = pred_all_extrinsic[..., :, 3]             # [B, S, 4] = [tx,ty,tz,1]
-            new_last_col = torch.cat(
-                [last_col[..., :3] * scale_factor, last_col[..., 3:]], dim=-1)  # scale xyz, keep 1
-            pred_all_extrinsic = torch.cat(
-                [rot_cols, new_last_col.unsqueeze(-1)], dim=-1)  # [B, S, 4, 4]
+            pred_all_extrinsic[..., :3, 3] = pred_all_extrinsic[..., :3, 3] * scale_factor
             render_viewmats, render_Ks = pred_all_extrinsic, pred_all_intrinsic
             valid_masks = views.get("valid_mask", torch.ones(B, S + V, H, W, dtype=bool, device=images.device))
             render_timestamps = views["timestamp"]

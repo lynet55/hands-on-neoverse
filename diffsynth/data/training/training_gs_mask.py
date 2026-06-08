@@ -63,6 +63,16 @@ class TrainConfig:
     depth_loss_weight: float = 0.05
     depth_loss_eps: float = 1e-4
 
+    # --- Gaussian-Params improvement experiments (all default-off = original behaviour) ---
+    lovasz_loss_weight: float = 0.0      # #3: Lovász-softmax (directly optimizes IoU / boundaries)
+    unfreeze_last_n_blocks: int = 0      # #4: also train the last N backbone blocks (more capacity)
+    detach_geometry_for_mask: bool = False  # #6: mask loss only updates mask logits, not geometry
+
+    # --- bounded fine-tune controls (0 = disabled / original full-epoch behaviour) ---
+    max_steps: int = 0                   # stop after this many optimizer steps (0 = run all epochs)
+    save_every: int = 0                  # also checkpoint every N steps (0 = per-epoch only)
+    finetune_reset: bool = False         # load weights from resume_from but restart step/LR schedule
+
     frame_stride: int = 3
     val_fraction: float = 0.1
 
@@ -143,8 +153,51 @@ class GsMaskReconstructor:
         if hasattr(self.reconstructor.gs_renderer, "gs_head_dynamic"):
             for p in self.reconstructor.gs_renderer.gs_head_dynamic.parameters():
                 p.requires_grad = True
+        # #4: optionally unfreeze the last N backbone blocks (more capacity than the
+        # final head alone). Saved/loaded alongside gs_head and added to the optimizer.
+        self.unfrozen_backbone = {}
+        if cfg.unfreeze_last_n_blocks > 0:
+            self._unfreeze_last_backbone_blocks(cfg.unfreeze_last_n_blocks)
+
         self.set_train_mode()
         dbg("gs_head cast to float32.")
+
+    def _unfreeze_last_backbone_blocks(self, n: int):
+        """Unfreeze (and fp32-cast) the last n transformer blocks of the backbone."""
+        import re
+        backbone = self.reconstructor.visual_geometry_transformer
+        pat = re.compile(r"\.blocks\.(\d+)\.")
+        idxs = {int(m.group(1)) for name, _ in backbone.named_parameters()
+                if (m := pat.search(name))}
+        if not idxs:
+            dbg("  [#4] no '.blocks.<i>.' params found in backbone — skipping unfreeze.")
+            return
+        cutoff = max(idxs) - n + 1
+        count = 0
+        for name, param in backbone.named_parameters():
+            m = pat.search(name)
+            if m and int(m.group(1)) >= cutoff:
+                param.data = param.data.float()      # fp32 master weights for AdamW under autocast
+                param.requires_grad = True
+                self.unfrozen_backbone[f"visual_geometry_transformer.{name}"] = param
+                count += 1
+        dbg(f"  [#4] unfroze {count} params in backbone blocks {cutoff}..{max(idxs)} "
+            f"(last {n} of {max(idxs)+1}).")
+
+    def _detach_geometry(self, batch_splats):
+        """#6: detach geometry attrs on each splat in-place; return originals for restore."""
+        saved = []
+        for sp in batch_splats:
+            saved.append((sp.means, sp.rotations, sp.scales, sp.opacities))
+            sp.means = sp.means.detach()
+            sp.rotations = sp.rotations.detach()
+            sp.scales = sp.scales.detach()
+            sp.opacities = sp.opacities.detach()
+        return saved
+
+    def _restore_geometry(self, batch_splats, saved):
+        for sp, (means, rot, scales, opac) in zip(batch_splats, saved):
+            sp.means, sp.rotations, sp.scales, sp.opacities = means, rot, scales, opac
 
     def _restore_pretrained_gs_head_weights(self, ckpt_path: str, device: str):
         """Copy pre-trained geometry channels into the expanded gs_head final conv.
@@ -201,6 +254,7 @@ class GsMaskReconstructor:
         params = list(self.reconstructor.gs_renderer.gs_head.parameters())
         if hasattr(self.reconstructor.gs_renderer, "gs_head_dynamic"):
             params += list(self.reconstructor.gs_renderer.gs_head_dynamic.parameters())
+        params += list(self.unfrozen_backbone.values())   # #4 (empty unless enabled)
         return params
 
     def forward(self, images: torch.Tensor):
@@ -213,9 +267,14 @@ class GsMaskReconstructor:
             dict with rendered mask logits, RGB, depth, alpha, and frozen
             gs_depth pseudo-targets.
         """
+        cfg = self.cfg
+        # #5: optionally render/supervise at higher resolution. img_shape must be a
+        # multiple of patch_size; GT masks are upsampled to match in compute_losses.
+        if tuple(images.shape[-2:]) != tuple(cfg.img_shape):
+            images = F.interpolate(images, size=tuple(cfg.img_shape),
+                                   mode="bilinear", align_corners=False)
         B, C, H, W = images.shape
         # Treat each image in the batch as a 1-frame sequence
-        cfg = self.cfg
         imgs = images.unsqueeze(1).to(cfg.device, non_blocking=True)  # [B, 1, 3, H, W]
 
         views = {
@@ -249,15 +308,18 @@ class GsMaskReconstructor:
         batch_alphas = []
         for b in range(B):
             w2c_b = homo_matrix_inverse(input_c2w[b])   # [1, 4, 4]
-            rendered_rgb, rendered_depth, rendered_alpha, rendered_masks = self.reconstructor.gs_renderer.rasterizer.forward(
-                render_splats=[gaussians[b]],
-                render_viewmats=[w2c_b],
-                render_Ks=[input_intrs[b]],
-                render_timestamps=[input_timestamps[b]],
-                sh_degree=0,
-                width=W,
-                height=H,
-            )
+            ras = self.reconstructor.gs_renderer.rasterizer
+            rkw = dict(render_viewmats=[w2c_b], render_Ks=[input_intrs[b]],
+                       render_timestamps=[input_timestamps[b]], sh_degree=0, width=W, height=H)
+            rendered_rgb, rendered_depth, rendered_alpha, rendered_masks = ras.forward(
+                render_splats=[gaussians[b]], **rkw)
+            if self.cfg.detach_geometry_for_mask:
+                # #6: re-render the mask channels with Gaussian geometry detached so the
+                # mask CE/Dice/Lovász loss only updates the per-Gaussian mask logits — not
+                # positions/opacity/scale (those keep learning from the RGB/depth anchors).
+                saved = self._detach_geometry(gaussians[b])
+                _, _, _, rendered_masks = ras.forward(render_splats=[gaussians[b]], **rkw)
+                self._restore_geometry(gaussians[b], saved)
             if rendered_masks is None:
                 raise RuntimeError(
                     "Rasterizer returned no rendered mask logits. Check that "
@@ -271,11 +333,7 @@ class GsMaskReconstructor:
             batch_rgbs.append(rendered_rgb)      # [1, H, W, 3]
             batch_depths.append(rendered_depth)  # [1, H, W, 1]
             batch_alphas.append(rendered_alpha)  # [1, H, W, 1]
-<<<<<<< Updated upstream
-            batch_masks.append(rendered_masks)  # [1, H, W, C]
-=======
             batch_masks.append(rendered_masks)   # [1, H, W, C]
->>>>>>> Stashed changes
 
         # [B, H, W, C] -> [B, C, H, W] for loss
         rendered_masks = torch.cat(batch_masks, dim=0)          # [B, H, W, C]
@@ -352,6 +410,46 @@ class DiceLoss:
         return 1.0 - per_sample.mean()
 
 
+def _lovasz_grad(gt_sorted):
+    """Gradient of the Lovász extension of the Jaccard loss (Berman et al. 2018)."""
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+class LovaszSoftmax:
+    """Multi-class Lovász-softmax — a smooth, direct surrogate for (1 - mIoU).
+
+    Operates on softmax probabilities so it pairs naturally with the rendered
+    mask logits; complements CE/Dice by optimizing the IoU ordering and the
+    object/hand boundaries where the splat-composited masks are weakest.
+    """
+
+    def __call__(self, logits, target_onehot):
+        probs = torch.softmax(logits, dim=1)        # [B, C, H, W]
+        B, C, H, W = probs.shape
+        labels = target_onehot.argmax(dim=1)         # [B, H, W]
+        losses = []
+        for b in range(B):
+            pb = probs[b].reshape(C, -1)             # [C, P]
+            lb = labels[b].reshape(-1)               # [P]
+            present = torch.unique(lb)
+            for c in present.tolist():
+                fg = (lb == c).float()               # foreground for class c
+                errors = (fg - pb[c]).abs()
+                errors_sorted, perm = torch.sort(errors, descending=True)
+                fg_sorted = fg[perm]
+                losses.append(torch.dot(errors_sorted, _lovasz_grad(fg_sorted)))
+        if not losses:
+            return logits.new_zeros(())
+        return torch.stack(losses).mean()
+
+
 def masked_mean(values: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(eps)
 
@@ -385,7 +483,7 @@ def reconstruction_losses(outputs, cfg: TrainConfig):
     return rgb_loss, depth_loss
 
 
-def compute_losses(outputs, gt_mask, criterion, dice_loss_fn, cfg: TrainConfig):
+def compute_losses(outputs, gt_mask, criterion, dice_loss_fn, cfg: TrainConfig, lovasz_loss_fn=None):
     rendered = outputs["mask_logits"]
     if rendered.shape[-2:] != gt_mask.shape[-2:]:
         gt_mask = F.interpolate(gt_mask, size=rendered.shape[-2:], mode="nearest")
@@ -395,6 +493,8 @@ def compute_losses(outputs, gt_mask, criterion, dice_loss_fn, cfg: TrainConfig):
     dl = dice_loss_fn(rendered, gt_mask)
     rgb_loss, depth_loss = reconstruction_losses(outputs, cfg)
     loss = ce + dl + cfg.rgb_loss_weight * rgb_loss + cfg.depth_loss_weight * depth_loss
+    if lovasz_loss_fn is not None and cfg.lovasz_loss_weight > 0:
+        loss = loss + cfg.lovasz_loss_weight * lovasz_loss_fn(rendered, gt_mask)
     return loss, ce, dl, rgb_loss, depth_loss, rendered, gt_mask
 
 
@@ -455,6 +555,8 @@ def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, avg_miou, cfg
     }
     if hasattr(model.reconstructor.gs_renderer, "gs_head_dynamic"):
         params["gs_head_dynamic"] = model.reconstructor.gs_renderer.gs_head_dynamic.state_dict()
+    if getattr(model, "unfrozen_backbone", None):   # #4: save unfrozen backbone blocks
+        params["unfrozen_backbone"] = {k: v.detach().cpu() for k, v in model.unfrozen_backbone.items()}
 
     ckpt = {
         "epoch": epoch,
@@ -468,6 +570,8 @@ def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, avg_miou, cfg
         "run_id": cfg.run_id,
     }
     torch.save(ckpt, f"{cfg.save_model_path_prefix}_latest.ckpt")
+    if cfg.save_every and global_step:   # keep the trajectory so we can pick the true best
+        torch.save(ckpt, f"{cfg.save_model_path_prefix}_step{global_step}.ckpt")
     epoch_path = f"{cfg.save_model_path_prefix}_run{cfg.run_id}_epoch{epoch+1:03d}.ckpt"
     torch.save(ckpt, epoch_path)
     dbg(f"  -> saved {os.path.basename(epoch_path)}")
@@ -494,6 +598,17 @@ def load_checkpoint(model, optimizer, cfg, train_loader_len: int):
     model.reconstructor.gs_renderer.gs_head.load_state_dict(params["gs_head"], strict=True)
     if "gs_head_dynamic" in params and hasattr(model.reconstructor.gs_renderer, "gs_head_dynamic"):
         model.reconstructor.gs_renderer.gs_head_dynamic.load_state_dict(params["gs_head_dynamic"], strict=True)
+    if "unfrozen_backbone" in params and getattr(model, "unfrozen_backbone", None):   # #4
+        with torch.no_grad():
+            for k, saved in params["unfrozen_backbone"].items():
+                if k in model.unfrozen_backbone:
+                    model.unfrozen_backbone[k].copy_(saved.to(model.unfrozen_backbone[k].device))
+
+    if cfg.finetune_reset:
+        # Bounded fine-tune: keep the loaded weights, but restart the optimizer/LR
+        # schedule and step counter so the new loss term actually learns.
+        dbg("Fine-tune reset: loaded weights only; fresh optimizer/LR, global_step=0.")
+        return 0, 0, float("inf")
 
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     for state in optimizer.state.values():
@@ -513,7 +628,7 @@ def load_checkpoint(model, optimizer, cfg, train_loader_len: int):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
+def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names, lovasz_loss_fn=None):
     model.set_eval_mode()
     total_loss = 0.0
     total_ce = 0.0
@@ -532,7 +647,7 @@ def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
         gt_mask = gt_mask.to(cfg.device, non_blocking=True)
         outputs = model.forward(images)
         loss, ce, dl, rgb_loss, depth_loss, rendered, gt_mask = compute_losses(
-            outputs, gt_mask, criterion, dice_loss_fn, cfg
+            outputs, gt_mask, criterion, dice_loss_fn, cfg, lovasz_loss_fn
         )
 
         miou, pc_iou = compute_miou(rendered, gt_mask, cfg.num_classes)
@@ -573,10 +688,36 @@ def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
 # Training loop
 # ---------------------------------------------------------------------------
 
+def _apply_env_overrides(cfg: TrainConfig) -> TrainConfig:
+    """Override config from GSMASK_* env vars (for bounded experiment runs)."""
+    g = os.environ.get
+    if g("GSMASK_DATA_ROOT"):    cfg.data_root = g("GSMASK_DATA_ROOT")
+    if g("GSMASK_RESUME_FROM"):  cfg.resume_from = g("GSMASK_RESUME_FROM")
+    if g("GSMASK_SAVE_PREFIX"):  cfg.save_model_path_prefix = g("GSMASK_SAVE_PREFIX")
+    if g("GSMASK_LOVASZ"):       cfg.lovasz_loss_weight = float(g("GSMASK_LOVASZ"))
+    if g("GSMASK_DETACH_GEOM"):  cfg.detach_geometry_for_mask = g("GSMASK_DETACH_GEOM") == "1"
+    if g("GSMASK_UNFREEZE_N"):   cfg.unfreeze_last_n_blocks = int(g("GSMASK_UNFREEZE_N"))
+    if g("GSMASK_IMG"):          cfg.img_shape = (int(g("GSMASK_IMG")), int(g("GSMASK_IMG")))
+    if g("GSMASK_MAX_STEPS"):    cfg.max_steps = int(g("GSMASK_MAX_STEPS"))
+    if g("GSMASK_SAVE_EVERY"):   cfg.save_every = int(g("GSMASK_SAVE_EVERY"))
+    if g("GSMASK_EPOCHS"):       cfg.epochs = int(g("GSMASK_EPOCHS"))
+    if g("GSMASK_FRAME_STRIDE"): cfg.frame_stride = int(g("GSMASK_FRAME_STRIDE"))
+    if g("GSMASK_FINETUNE"):     cfg.finetune_reset = g("GSMASK_FINETUNE") == "1"
+    if g("GSMASK_LR"):           cfg.learning_rate = float(g("GSMASK_LR"))
+    if g("GSMASK_RUN_ID"):       # pin run name → predictable TensorBoard dir + ckpt names
+        cfg.run_id = g("GSMASK_RUN_ID")
+        cfg.log_dir = f"runs/neoverse_gs_mask_{cfg.run_id}"
+    return cfg
+
+
 def train():
     dbg("=== train() [gs_mask] ===")
-    cfg = TrainConfig()
+    cfg = _apply_env_overrides(TrainConfig())
     dbg(f"device={cfg.device}, batch={cfg.batch_size}, epochs={cfg.epochs}, lr={cfg.learning_rate}")
+    dbg(f"data_root={cfg.data_root} resume_from={cfg.resume_from} save_prefix={cfg.save_model_path_prefix}")
+    dbg(f"experiments: lovasz={cfg.lovasz_loss_weight} detach_geom={cfg.detach_geometry_for_mask} "
+        f"unfreeze_n={cfg.unfreeze_last_n_blocks} img={cfg.img_shape} "
+        f"max_steps={cfg.max_steps} save_every={cfg.save_every}")
 
     model = GsMaskReconstructor(cfg)
     model.set_train_mode()
@@ -601,8 +742,10 @@ def train():
 
     criterion = nn.CrossEntropyLoss(weight=cfg.class_weights.to(cfg.device), label_smoothing=0.0)
     dice_loss_fn = DiceLoss()
+    lovasz_loss_fn = LovaszSoftmax()
     dbg(f"class weights (bg=1): {cfg.class_weights.tolist()}")
-    dbg(f"loss weights: rgb={cfg.rgb_loss_weight} depth={cfg.depth_loss_weight}")
+    dbg(f"loss weights: rgb={cfg.rgb_loss_weight} depth={cfg.depth_loss_weight} "
+        f"lovasz={cfg.lovasz_loss_weight}")
 
     # Optimizer + schedulers
     trainable = model.trainable_parameters()
@@ -671,7 +814,7 @@ def train():
             t_fwd = time.time()
             outputs = model.forward(images)
             loss, ce, dl, rgb_loss, depth_loss, rendered, gt_mask = compute_losses(
-                outputs, gt_mask, criterion, dice_loss_fn, cfg
+                outputs, gt_mask, criterion, dice_loss_fn, cfg, lovasz_loss_fn
             )
 
             # First-step sanity diagnostics
@@ -745,6 +888,24 @@ def train():
                     f"fetch={fetch_time:.2f}s fwd+bwd={step_time:.2f}s"
                 )
 
+            # Bounded fine-tune: periodic checkpoint + hard step cap.
+            if cfg.save_every and global_step % cfg.save_every == 0:
+                running = sum(loss_window) / max(1, len(loss_window))
+                best_val_loss = save_checkpoint(
+                    model, optimizer, epoch, running, running,
+                    sum(miou_window) / max(1, len(miou_window)), cfg, best_val_loss, global_step)
+                dbg(f"  [bounded] periodic checkpoint at step {global_step}")
+            if cfg.max_steps and global_step >= cfg.max_steps:
+                dbg(f"  [bounded] reached max_steps={cfg.max_steps} — stopping.")
+                save_checkpoint(model, optimizer, epoch,
+                                sum(loss_window) / max(1, len(loss_window)),
+                                sum(loss_window) / max(1, len(loss_window)),
+                                sum(miou_window) / max(1, len(miou_window)),
+                                cfg, best_val_loss, global_step)
+                writer.close()
+                dbg("=== Training complete (max_steps) ===")
+                return
+
         if global_step >= warmup_steps:
             decay.step()
         if step < 0:
@@ -764,7 +925,7 @@ def train():
 
         # Validation
         val_loss, val_ce, val_dice, val_rgb, val_depth, val_miou, val_per_class_iou, val_per_class_acc, val_confusion = evaluate(
-            model, val_loader, criterion, dice_loss_fn, cfg, class_names
+            model, val_loader, criterion, dice_loss_fn, cfg, class_names, lovasz_loss_fn
         )
 
         # TensorBoard — per epoch (train)

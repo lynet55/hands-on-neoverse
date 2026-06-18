@@ -3,9 +3,9 @@
 #SBATCH --job-name=neoverse_eval_seg
 #SBATCH --partition=jobs
 #SBATCH --time=0-01:00:00
-#SBATCH --chdir=/work/courses/3dv/team32/handy-NeoVerse
-#SBATCH --output=/work/courses/3dv/team32/handy-NeoVerse/logs/eval_seg_%j.out
-#SBATCH --error=/work/courses/3dv/team32/handy-NeoVerse/logs/eval_seg_%j.err
+#SBATCH --chdir=/work/courses/3dv/team32/hands-on-neoverse
+#SBATCH --output=/work/courses/3dv/team32/hands-on-neoverse/logs/eval_seg_%j.out
+#SBATCH --error=/work/courses/3dv/team32/hands-on-neoverse/logs/eval_seg_%j.err
 
 mkdir -p logs outputs
 

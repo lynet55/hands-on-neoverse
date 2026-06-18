@@ -3,9 +3,9 @@
 #SBATCH --job-name=gs_mask_train
 #SBATCH --partition=jobs
 #SBATCH --time=2-06:00:00
-#SBATCH --chdir=/work/courses/3dv/team32/handy-NeoVerse
-#SBATCH --output=/work/courses/3dv/team32/handy-NeoVerse/logs/gs_mask_train_%j.out
-#SBATCH --error=/work/courses/3dv/team32/handy-NeoVerse/logs/gs_mask_train_%j.err
+#SBATCH --chdir=/work/courses/3dv/team32/hands-on-neoverse
+#SBATCH --output=/work/courses/3dv/team32/hands-on-neoverse/logs/gs_mask_train_%j.out
+#SBATCH --error=/work/courses/3dv/team32/hands-on-neoverse/logs/gs_mask_train_%j.err
 
 set -eo pipefail
 

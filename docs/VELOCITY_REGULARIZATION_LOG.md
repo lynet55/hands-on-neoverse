@@ -4,6 +4,49 @@
 hand/object (foreground) velocity intact, in the NeoVerse 4DGS reconstructor.
 Only the velocity heads are trainable (backbone frozen) unless noted.
 
+## Setup: modules, what was frozen, and the loss terms
+
+**Model.** NeoVerse / WorldMirror 4DGS reconstructor. A shared transformer trunk
+(`frame_blocks` / global blocks) produces a `token_list` consumed by the *static* heads:
+`depth_head`, `pts_head` (→`pts3d`, world points), the camera head, the Gaussian-splat
+(`gs`) head, and `hand_pred_head` (per-pixel `seg_labels`, classes right/left/object/bg).
+Two additional backbone stacks, `motion_fwd_blocks` / `motion_bwd_blocks`, consume the
+same `token_list` and feed *only* the per-pixel `velocity_fwd_head` / `velocity_bwd_head`
+(DPT heads). The motion blocks do **not** write back into `token_list`, so unfreezing them
+cannot change the static heads' outputs.
+
+**Teacher.** A frozen copy of the pure reconstructor, used three ways: (a) weight init,
+(b) the `preserve_fg` target (its predicted foreground velocity), (c) distillation anchors
+for camera / depth / seg.
+
+**Rasterizer.** `transition()` moves Gaussians along their velocity to the render
+timestamp; at integer (keyframe) timestamps it is the identity → **no velocity gradient**.
+`bidirection` blends the forward- and backward-pushed Gaussians at a midpoint.
+
+**Loss terms** (logged component name in brackets):
+- `interp_loss` [interp] — RGB L2 on held-out (odd) frames rendered at *fractional*
+  timestamps via velocity. The only term that gives the velocity heads a real data gradient.
+- `keyframe rgb` [rgb] — RGB L2 on the seen keyframes.
+- `bg_gaussian_vel` [bg_vel] — magnitude penalty on background (seg class 3) Gaussian
+  velocity. L2 → gradient ∝ magnitude (vanishes near 0); L1 → constant gradient (actually
+  drives bg → 0).
+- `preserve_fg` — anchors student foreground (hand/object) velocity to the teacher's
+  predicted velocity; a floor meant to stop the foreground from collapsing. L2 or L1.
+- `velocity_balance` [balance] — keeps fwd and bwd magnitudes comparable (stops one
+  direction dying). Its early `.norm()` form produced the NaN at v=0.
+- `camera / depth / seg distill` [cam, depth] — keep the static heads ≈ the frozen teacher;
+  inert while the backbone and those heads are frozen.
+
+**Trainable vs frozen, by phase:**
+- **#1 (24h):** trainable = `frame_blocks` (shared trunk) + `motion_fwd/bwd_blocks` +
+  velocity heads; single LR 1e-4; **no** `interp_loss`; integer timestamps.
+- **#2–#10 (heads-only):** trainable = `velocity_fwd_head` + `velocity_bwd_head` **only**;
+  everything else frozen (entire backbone incl. motion blocks, and all static heads); LR
+  1e-4 then 1e-5.
+- **#11:** trainable = velocity heads (LR 1e-5) + `motion_fwd_blocks` / `motion_bwd_blocks`
+  (LR 1e-6); frozen = `frame_blocks` / trunk + all static heads; float32 master weights on
+  the trainable params; init from the pure reconstructor.
+
 ## Infrastructure findings (independent of any run)
 - The original benchmark/demo render with `use_motion=False` → **blind to velocity**.
   Built a proper interpolation eval: hold out the odd frames, feed keyframes only at
@@ -29,6 +72,41 @@ Only the velocity heads are trainable (backbone frozen) unless noted.
 | 8 | diagnostic: logged teacher fg vel (the preserve_fg *target*) | Target ≈ **0.006** (teacher *training-path* fg, vs 0.028 eval-path). preserve_fg L2 loss ~9e-5 → gradient ∝(v−tv) vanishes near small v → **steamrolled by L1 bg_vel**. |
 | 9 | preserve_fg → **L1** (constant gradient, wt 10) vs bg_vel L1 (wt 5); hinge removed | Collapse, **identical**: eval **fg/bg = 1.0×** (uniform), all ~3e-4, PSNR 16.34. |
 | 10 | learning_rate 1e-4 → **1e-5** | Same collapse (observed). |
+
+## Progression (observation → action)
+The thread behind the table — what each run showed and what was changed next.
+- **#1 → eval fix.** Observed: +0.5 PSNR, but the benchmark rendered with
+  `use_motion=False` (blind to velocity), and the velocity itself was unhealthy — backward
+  collapsed to 0, forward alive → "two hands" ghosting. Action: built the velocity-aware
+  interpolation eval; found that integer-timestamp rendering gives zero velocity gradient,
+  so added `interp_loss` at fractional timestamps.
+- **#2.** Froze the whole backbone, trained the two velocity heads only
+  (`preserve_fg`=20, `balance`=5). Observed: the asymmetric collapse flipped — forward died
+  at eval; worse than the teacher.
+- **#3.** Added `interp_loss`, all loss weights = 1 (9h). Observed: PSNR parity with the
+  teacher, velocities alive, but background velocity essentially unchanged — `bg_vel` too
+  weak to move it (objective not met).
+- **#4.** Raised `bg_vel` to 20. Observed: full collapse (fg+bg → 0) within ~2k steps.
+- **#5.** `bg_vel`=5, `preserve_fg`=10 (L2) + a hinge floor. Observed: collapse.
+- **#6.** Switched `bg_vel` to **L1**. Observed: bg fell ~18× to 3e-4 (working) — then a NaN
+  crash from `velocity_balance`'s `.norm()` at v=0.
+- **#7.** Added NaN fixes, set `frame_stride`=3, resumed the #3 parity checkpoint; L1
+  `bg_vel`=5, L2 `preserve_fg`=10. Observed: train- and eval-path `vel_fg` → 0 together.
+- **#8 (diagnostic).** Logged the teacher's foreground velocity — the `preserve_fg` *target*
+  — on the training path: ≈0.006 (vs 0.028 on the eval path). The L2 `preserve_fg` gradient
+  ∝ (v − target) vanishes near small v, so it was steamrolled by the constant-gradient L1
+  `bg_vel`.
+- **#9.** Switched `preserve_fg` to **L1** (wt 10) against `bg_vel` L1 (wt 5), removed the
+  hinge. Observed: identical collapse — eval fg/bg = 1.0× (spatially uniform), all ~3e-4,
+  PSNR 16.34.
+- **#10.** Lowered LR 1e-4 → 1e-5. Observed: same collapse.
+- **Diagnosis.** No output-space reweighting (L1/L2, weights, hinge) or LR change fixed it →
+  the frozen, shared velocity head cannot represent "high fg, zero bg"; the two are
+  entangled in its parameters (capacity, not tuning).
+- **#11.** Unfroze only `motion_fwd/bwd_blocks` (LR 1e-6) to add that capacity, kept the
+  heads at 1e-5, and initialised from the pure reconstructor. Observed: the first
+  non-collapsed run that also reduced background velocity (fg/bg up to 5.1× / 9.7×) at PSNR
+  parity. Detailed eval blocks in Appendix A.
 
 ## Diagnosis (the wall)
 Under **any** meaningful `bg_vel`, the velreg velocity head collapses to spatially
@@ -111,3 +189,170 @@ rigidity ❌ (no value / harmful), fwd/bwd consistency ❌ (no headroom). The re
 PSNR gap and low absolute PSNR on hard windows are the **constant-velocity interpolation
 ceiling**, not addressable by any velocity loss. Recommendation: ship/write up #11; stop
 adding velocity losses.
+
+---
+
+## Appendix A — verbatim eval dumps (recovered from the session transcript)
+
+The tables above are a *distillation*. The raw console blocks below are reproduced
+**verbatim** from the working session (transcript
+`325832a4-…-neoverse/325832a4-ac86-4086-9679-e0f50f8b1e4a.jsonl`) so the condensed numbers
+are auditable. All on `clip-001160`; "original" = the frozen teacher reconstructor.
+
+### A1 — early head-only `bg_vel` run, stride-3 benchmark (≈ attempt #2; forward collapsed, backward alive)
+```
+=== Mean interpolation quality on hidden frames (higher = better) ===
+        original:  PSNR 17.968   bg-PSNR 18.746  SSIM 0.6049
+    velocity_reg:  PSNR 16.680   bg-PSNR 17.541  SSIM 0.5830
+  -> best by background PSNR: original
+
+=== Predicted velocity magnitude (background should be ~0) ===
+  original:
+      fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+      bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+  velocity_reg:
+      fwd:  bg 0.0007   fg 0.0006  fg/bg 0.9x      <- forward collapsed (fg≈bg)
+      bwd:  bg 0.0034   fg 0.0137  fg/bg 4.0x      <- backward still alive
+```
+
+### A2 — same run, stride-1 benchmark (frame-stride sweep)
+```
+=== Mean interpolation quality on hidden frames (higher = better) ===
+        original:  PSNR 22.902   bg-PSNR 24.509  SSIM 0.8161
+    velocity_reg:  PSNR 21.912   bg-PSNR 23.114  SSIM 0.7909
+  -> best by background PSNR: original
+
+=== Predicted velocity magnitude (background should be ~0) ===
+  original:
+      fwd:  bg 0.0031   fg 0.0121  fg/bg 3.9x
+      bwd:  bg 0.0024   fg 0.0098  fg/bg 4.0x
+  velocity_reg:
+      fwd:  bg 0.0007   fg 0.0007  fg/bg 1.0x
+      bwd:  bg 0.0012   fg 0.0037  fg/bg 3.1x
+```
+
+### A3 — 9h parity run (attempt #3) and its resume eval @ step 20399
+```
+=== Mean interpolation quality on hidden frames (higher = better) ===
+        original:  PSNR 17.968   bg-PSNR 18.746  SSIM 0.6049
+    velocity_reg:  PSNR 17.900   bg-PSNR 18.640  SSIM 0.6065
+  -> best by background PSNR: original
+
+=== Predicted velocity magnitude (background should be ~0) ===
+  original:
+      fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+      bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+  velocity_reg:
+      fwd:  bg 0.0067   fg 0.0243  fg/bg 3.6x      <- bg essentially unchanged (objective not met)
+      bwd:  bg 0.0044   fg 0.0306  fg/bg 7.0x
+```
+```
+=== [in-training eval @ step 20399] interpolation quality (higher=better) ===
+        original:  PSNR 17.968   bg-PSNR 18.746   SSIM 0.6049
+    velocity_reg:  PSNR 17.899   bg-PSNR 18.639   SSIM 0.6065
+  --- predicted velocity magnitude (background should be ~0) ---
+          original fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+          original bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+      velocity_reg fwd:  bg 0.0067   fg 0.0243  fg/bg 3.6x
+      velocity_reg bwd:  bg 0.0044   fg 0.0306  fg/bg 7.0x
+```
+
+### A4 — collapse runs (attempts #4–#10 family; uniform fg/bg = 1.0×)
+```
+=== [in-training eval @ step 22398] interpolation quality (higher=better) ===
+        original:  PSNR 17.968   bg-PSNR 18.746   SSIM 0.6049
+    velocity_reg:  PSNR 16.331   bg-PSNR 17.291   SSIM 0.5729
+  --- predicted velocity magnitude (background should be ~0) ---
+          original fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+          original bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+      velocity_reg fwd:  bg 0.0003   fg 0.0003  fg/bg 1.0x
+      velocity_reg bwd:  bg 0.0001   fg 0.0001  fg/bg 1.0x
+```
+```
+=== [in-training eval @ step 20898] interpolation quality (higher=better) ===   (attempt #9, L1 preserve_fg)
+        original:  PSNR 17.968   bg-PSNR 18.746   SSIM 0.6049
+    velocity_reg:  PSNR 16.340   bg-PSNR 17.298   SSIM 0.5728
+  --- predicted velocity magnitude (background should be ~0) ---
+          original fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+          original bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+      velocity_reg fwd:  bg 0.0002   fg 0.0002  fg/bg 1.0x
+      velocity_reg bwd:  bg 0.0004   fg 0.0004  fg/bg 1.0x
+```
+```
+=== [in-training eval @ step 25898] interpolation quality (higher=better) ===   (vel_reg.py duplicate; total collapse incl. foreground)
+        original:  PSNR 17.968   bg-PSNR 18.746   SSIM 0.6049
+    velocity_reg:  PSNR 16.329   bg-PSNR 17.289   SSIM 0.5725
+  --- predicted velocity magnitude (background should be ~0) ---
+          original fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+          original bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+      velocity_reg fwd:  bg 0.0000   fg 0.0000  fg/bg 1.0x
+      velocity_reg bwd:  bg 0.0000   fg 0.0000  fg/bg 1.0x
+```
+
+### A5 — attempt #11 (first valid run), in-training eval @ step 19999
+```
+=== [in-training eval @ step 19999] interpolation quality (higher=better) ===
+        original:  PSNR 17.968   bg-PSNR 18.746   SSIM 0.6049
+    velocity_reg:  PSNR 17.830   bg-PSNR 18.597   SSIM 0.5989
+  --- predicted velocity magnitude (background should be ~0) ---
+          original fwd:  bg 0.0072   fg 0.0283  fg/bg 4.0x
+          original bwd:  bg 0.0046   fg 0.0278  fg/bg 6.1x
+      velocity_reg fwd:  bg 0.0052   fg 0.0265  fg/bg 5.1x      <- bg down, fg held, separation UP
+      velocity_reg bwd:  bg 0.0029   fg 0.0280  fg/bg 9.7x
+```
+
+### A6 — #11 per-region (regions demo, bidirection eval) + rigid fit BEFORE the GT-mask fix
+The rigid block here is masked by the model's own `seg_labels` (class order ≠ GT) → speeds
+14–190× off the speed bars and **right_hand NaN**. Kept only to show the bug that motivated A7.
+```
+=== Interpolation quality on hidden frames (higher = better) ===
+        original:  PSNR 17.968   bg-PSNR 18.746  SSIM 0.6049
+    velocity_reg:  PSNR 17.879   bg-PSNR 18.641  SSIM 0.5993
+
+=== Per-region fwd-velocity (mean speed | std | dev-from-mean ~0=uniform | fwd/bwd disagree ~0=cancel) ===
+  original:
+           object:  mean 0.0199   std 0.0287   dev-from-mean 1.362   disagree 0.0294 (1.56×spd)
+       background:  mean 0.0072   std 0.0186   dev-from-mean 2.020   disagree 0.0083 (1.42×spd)
+        left_hand:  mean 0.0224   std 0.0233   dev-from-mean 1.164   disagree 0.0330 (1.47×spd)
+       right_hand:  mean 0.0582   std 0.0254   dev-from-mean 0.565   disagree 0.0497 (1.01×spd)
+  velocity_reg:
+           object:  mean 0.0191   std 0.0276   dev-from-mean 1.368   disagree 0.0284 (1.56×spd)
+       background:  mean 0.0052   std 0.0177   dev-from-mean 2.248   disagree 0.0068 (1.68×spd)
+        left_hand:  mean 0.0213   std 0.0223   dev-from-mean 1.174   disagree 0.0317 (1.46×spd)
+       right_hand:  mean 0.0562   std 0.0243   dev-from-mean 0.580   disagree 0.0481 (1.01×spd)
+
+=== Best-fit RIGID-body residual per region (one ω+t; rotation ALLOWED) ===   [BUGGED: model-seg mask]
+  original:
+           object:  rigid_resid 0.0025 (1.74×spd)   affine_resid 0.0025 (1.75×spd)   strain_frac 0.52
+       background:  rigid_resid 0.0132 (1.44×spd)   affine_resid 0.0133 (1.45×spd)   strain_frac 0.77
+        left_hand:  rigid_resid 0.0001 (0.84×spd)   affine_resid 0.0000 (0.28×spd)   strain_frac 0.74
+       right_hand:  rigid_resid nan (nan×spd)   affine_resid nan (nan×spd)   strain_frac nan
+  velocity_reg:
+           object:  rigid_resid 0.0205 (0.60×spd)   affine_resid 0.0102 (0.30×spd)   strain_frac 0.52
+       background:  rigid_resid 0.0037 (1.77×spd)   affine_resid 0.0038 (1.82×spd)   strain_frac 0.57
+        left_hand:  rigid_resid 0.0058 (0.12×spd)   affine_resid 0.0026 (0.05×spd)   strain_frac 0.49
+       right_hand:  rigid_resid 0.0162 (0.20×spd)   affine_resid 0.0129 (0.16×spd)   strain_frac 0.65
+```
+
+### A7 — #11 rigid fit AFTER the GT-mask fix (valid) + boundary band
+Cross-check passes (right_hand no longer NaN, implied speeds sane). This is the block the
+"reject rigidity loss" conclusion rests on: object rigid 0.49×spd, affine 0.22×spd (halved),
+`strain_frac` 0.53 → structured deformation, not noise; original ≈ velreg (fg structure untouched).
+```
+=== Best-fit RIGID-body residual per region (one ω+t; rotation ALLOWED) ===
+  original:
+           object:  rigid_resid 0.0201 (0.49×spd)   affine_resid 0.0089 (0.22×spd)   strain_frac 0.53
+       background:  rigid_resid 0.0064 (1.43×spd)   affine_resid 0.0064 (1.44×spd)   strain_frac 0.57
+        left_hand:  rigid_resid 0.0056 (0.10×spd)   affine_resid 0.0023 (0.04×spd)   strain_frac 0.50
+       right_hand:  rigid_resid 0.0140 (0.17×spd)   affine_resid 0.0106 (0.13×spd)   strain_frac 0.66
+  velocity_reg:
+           object:  rigid_resid 0.0192 (0.49×spd)   affine_resid 0.0088 (0.23×spd)   strain_frac 0.52
+       background:  rigid_resid 0.0047 (1.74×spd)   affine_resid 0.0048 (1.79×spd)   strain_frac 0.61
+        left_hand:  rigid_resid 0.0053 (0.11×spd)   affine_resid 0.0022 (0.04×spd)   strain_frac 0.49
+       right_hand:  rigid_resid 0.0143 (0.17×spd)   affine_resid 0.0107 (0.13×spd)   strain_frac 0.66
+
+=== Boundary band: mean fwd ‖v‖ vs signed distance to fg/bg silhouette (px; <0 fg, >0 bg) ===
+          dist(px):      -20      -10       -4        0        4       10       20
+          original:   0.0001   0.0260   0.0311   0.0260   0.0204   0.0186   0.0124
+      velocity_reg:   0.0000   0.0248   0.0299   0.0250   0.0197   0.0179   0.0119
+```

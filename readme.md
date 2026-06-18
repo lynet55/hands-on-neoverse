@@ -28,23 +28,41 @@ benchmarks, demos) sit in the top-level folders described below.
 | `interpolation_compare_demo.py` | Hides the odd frames of a window and compares how each model reconstructs them via the velocity field. | `python -m demos.interpolation_compare_demo` |
 | `interpolation_velocity_regions_demo.py` | Variant that splits the predicted velocity field into the four segmentation regions and characterises each one separately. | `python -m demos.interpolation_velocity_regions_demo` |
 
-Examples (reduced from [`outputs/`](outputs/); full-res artifacts live there):
+Example outputs below (reduced from [`outputs/`](outputs/); full-res artifacts live there).
+Each is captioned with the script that produced it and the file it writes.
 
-Segmentation eval (`gs_mask`), `input | prediction | ground truth`:
+**`eval_segmentation_gs_mask.py`** → `outputs/eval_seg_gs_mask_<clip>.mp4` (`input | prediction | ground truth`)
 
-![Segmentation eval](res/readme/eval_seg_gs_mask_clip-001053.gif)
+```bash
+python -m demos.eval_segmentation_gs_mask --npz diffsynth/data/training_data/clip-001053.npz \
+    --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt
+```
 
-Reconstruction comparison:
+![Segmentation eval from eval_segmentation_gs_mask.py](res/readme/eval_seg_gs_mask_clip-001053.gif)
 
-![Reconstruction comparison](res/readme/reconstruction_compare.png)
+**`reconstruction_compare_demo.py`** → `outputs/recon_demo/<clip>_<stream>_w<N>/comparison.png`
 
-Keyframe interpolation comparison:
+```bash
+python -m demos.reconstruction_compare_demo
+```
 
-![Interpolation comparison](res/readme/interpolation_compare.png)
+![Reconstruction comparison from reconstruction_compare_demo.py](res/readme/reconstruction_compare.png)
 
-Per-region velocity interpolation:
+**`interpolation_compare_demo.py`** → `outputs/interp_demo/<clip>_<stream>_w<N>/interpolation_comparison.png`
 
-![Velocity-region interpolation](res/readme/interpolation_velocity_regions.png)
+```bash
+python -m demos.interpolation_compare_demo
+```
+
+![Interpolation comparison from interpolation_compare_demo.py](res/readme/interpolation_compare.png)
+
+**`interpolation_velocity_regions_demo.py`** → `outputs/interp_velocity_regions/<clip>_<stream>/velocity_poster.png`
+
+```bash
+python -m demos.interpolation_velocity_regions_demo
+```
+
+![Velocity-region poster from interpolation_velocity_regions_demo.py](res/readme/velocity_poster.png)
 
 ### `evals/`
 
@@ -54,9 +72,11 @@ Per-region velocity interpolation:
 | `benchmark.py` | Older single-model reconstruction + segmentation benchmark. | `sbatch evals/jobscript.sh` |
 | `bechmark_interpolation.py` | Keyframe-interpolation rendering core (held-out in-between frames). Not run directly — imported by `benchmark_rec.py` and the interpolation demos. | _(library module)_ |
 
-Example reconstruction grid (gt / raw / naive / gsparam / skeleton):
-
-![Reconstruction grid for clip-001100](res/readme/benchmark_grid.png)
+These benchmarks emit **numeric** artifacts, not figures. `benchmark_rec.py`
+writes per-run JSON/CSV under `runs/benchmarks/` (`config.json`,
+`aggregate_<label>.json`, `per_clip_<label>.csv`, `comparison.json`, …) — see
+[Benchmark implementation details](docs/BENCHMARKS.md) for the schema. For
+visual comparisons, use the demos above.
 
 ### `hot3d/`
 
@@ -71,8 +91,7 @@ Example reconstruction grid (gt / raw / naive / gsparam / skeleton):
 | `precompute_features.py` | Pre-extracts frozen-backbone features to disk so training can skip the backbone (~85% of step time). | `python -m hot3d.precompute_features --data_root diffsynth/data/training_data --output_dir diffsynth/data/training_features --model_path models/NeoVerse/reconstructor.ckpt` |
 | `dataloader.py` | Minimal WebDataset sanity-check over a HOT3D shard. | `python -m hot3d.dataloader` |
 
-<!-- No example output committed yet — drop a rendered-mask figure here when available. -->
-![HOT3D clip with rendered masks](res/readme/hot3d_masks.png)
+
 
 ### `training/`
 
@@ -82,9 +101,10 @@ Example reconstruction grid (gt / raw / naive / gsparam / skeleton):
 | `gs_mask.py` | Trains per-Gaussian mask logits, rendered through the rasterizer and supervised against GT masks (only the `gs_head` trains). | `sbatch training/train_gs_mask.sh` |
 | `velocity_regularization.py` | Regularizes background (class 3) Gaussians toward ~0 velocity while leaving hand/object velocity free, using the frozen model as a teacher. | `sbatch training/train_vel_reg.sh` |
 
-Example velocity poster from the regularized model:
-
-![Velocity regularization poster](res/readme/velocity_poster.png)
+These scripts emit checkpoints to `models/NeoVerse/` and TensorBoard logs to
+`runs/`, not figures. To visualize a trained checkpoint, point one of the demos
+above at it (e.g. `interpolation_velocity_regions_demo.py` for a velocity
+poster of a regularized model).
 
 # How to
 

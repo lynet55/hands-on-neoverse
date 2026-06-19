@@ -106,7 +106,13 @@ These scripts emit checkpoints to `models/NeoVerse/` and TensorBoard logs to
 above at it (e.g. `interpolation_velocity_regions_demo.py` for a velocity
 poster of a regularized model).
 
-# How to
+# Loading training data:
+To generate the hand masks for the training dataset a MANO model has to be added to the repository, it can be found here: https://drive.google.com/drive/folders/1au4hhDPHVBV8G_FMBJ3i09lrl7jmoJvA?usp=sharing
+
+# How to run
+
+To run the the evals and the demos one of our trained model's has to be loaded, and can be found here:
+They should be placed in the following file paths:
 
 These scripts target the student cluster (SLURM) with a CUDA 12.8 toolchain.
 Create and populate the `neoverse` virtualenv once, then submit the job scripts.

@@ -123,6 +123,14 @@ already in place after cloning):
 You can also browse them on GitHub:
 https://github.com/lynet55/hands-on-neoverse/tree/main/models/NeoVerse
 
+The simplest way to check out the models is to launch the interactive
+reconstruction app, which loads a checkpoint and lets you explore its output in
+the browser:
+
+```bash
+python -m demos.reconstruction_demo --low_vram
+```
+
 These scripts target the student cluster (SLURM) with a CUDA 12.8 toolchain.
 Create and populate the `neoverse` virtualenv once, then submit the job scripts.
 

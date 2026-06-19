@@ -21,6 +21,7 @@ benchmarks, demos) sit in the top-level folders described below.
 
 | Script | What it does | Run |
 | --- | --- | --- |
+| `multi_model_demo.py` | **Interactive multi-model viewer** — loads all three trained heads (`hand_seg`, `gs_mask`, `vel_reg`) plus the base reconstructor, renders any subset side-by-side on the same clip, with checkboxes to toggle which classes (left/right hand, object, background) are rendered and a segmentation-overlay mode. Caches forward passes and renders so toggling stays snappy; shares a public link by default. | `bash demos/run_multi_model_demo.sh` |
 | `eval_segmentation.py` | Scores the 2D `hand_pred_head` on one NPZ clip and writes an `input \| prediction \| ground-truth` video. | `sbatch demos/eval_seg_job.sh` |
 | `eval_segmentation_gs_mask.py` | Same evaluation but for the per-Gaussian `gs_mask` head — scores the rasterized mask channels instead of the 2D head. | `python -m demos.eval_segmentation_gs_mask --npz diffsynth/data/training_data/clip-001053.npz --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt` |
 | `reconstruction_demo.py` | Reconstruction-only Gradio app (~1–2 GB VRAM, no diffusion model). | `python -m demos.reconstruction_demo --low_vram` |
@@ -122,13 +123,19 @@ already in place after cloning):
 You can also browse them on GitHub:
 https://github.com/lynet55/hands-on-neoverse/tree/main/models/NeoVerse
 
-The simplest way to check out the models is to launch the interactive
-reconstruction app, which loads a checkpoint and lets you explore its output in
-the browser:
+The simplest way to check out the models is to launch the **interactive
+multi-model viewer**, which loads the checkpoints under `models/NeoVerse/` by
+default, renders any subset of them side-by-side on the same clip, and lets you
+toggle which classes (left/right hand, object, background) are rendered — all in
+the browser. Run it on a GPU node; it prints a public share link by default:
 
 ```bash
-python -m demos.reconstruction_demo --low_vram
+bash demos/run_multi_model_demo.sh
 ```
+
+The app caches forward passes and renders, so flipping the class toggles or
+swapping render modes re-renders quickly. For a single-checkpoint reconstruction
+view there is also `python -m demos.reconstruction_demo --low_vram`.
 
 These scripts target the student cluster (SLURM) with a CUDA 12.8 toolchain.
 Create and populate the `neoverse` virtualenv once, then submit the job scripts.

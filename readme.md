@@ -111,8 +111,17 @@ To generate the hand masks for the training dataset a MANO model has to be added
 
 # How to run
 
-To run the the evals and the demos one of our trained model's has to be loaded, and can be found here:
-They should be placed in the following file paths:
+To run the evals and the demos, one of our trained models has to be loaded. The
+checkpoints are included in this repository under `models/NeoVerse/` (so they are
+already in place after cloning):
+
+- `models/NeoVerse/reconstructor.ckpt` — base reconstructor
+- `models/NeoVerse/hand_seg_model_opt_best.ckpt` — 2D hand segmentation head
+- `models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt` — per-Gaussian mask model
+- `models/NeoVerse/velocity_regularization_20260604-001953_epoch1_step20099.ckpt` — velocity-regularized model
+
+You can also browse them on GitHub:
+https://github.com/lynet55/hands-on-neoverse/tree/main/models/NeoVerse
 
 These scripts target the student cluster (SLURM) with a CUDA 12.8 toolchain.
 Create and populate the `neoverse` virtualenv once, then submit the job scripts.

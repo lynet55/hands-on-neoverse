@@ -83,7 +83,6 @@ visual comparisons, use the demos above.
 | Script | What it does | Run |
 | --- | --- | --- |
 | `optimized_download.py` | Downloads and pre-processes HOT3D clips into per-clip `clip-XXXXXX.npz` files (images + hand/object masks). | `python -m hot3d.optimized_download` |
-| `download_HOT3D.py` | Original (pre-optimisation) download + preprocess script. | `python -m hot3d.download_HOT3D` |
 | `extract_images.py` | Extracts per-stream images from a clip tar. | `python -m hot3d.extract_images` |
 | `make_masks.py` | Renders MANO hand/object segmentation masks for a clip. | `python -m hot3d.make_masks` |
 | `extract_training_data.py` | Packs extracted images + masks into NPZ and writes ready-sentinels for the dataset to ingest. | `python -m hot3d.extract_training_data` |

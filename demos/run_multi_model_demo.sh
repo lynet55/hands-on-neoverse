@@ -2,7 +2,6 @@
 #SBATCH --account=3dv
 #SBATCH --job-name=neoverse_multi_model_demo
 #SBATCH --partition=jobs
-#SBATCH --gres=gpu:1
 #SBATCH --time=0-04:00:00
 #SBATCH --chdir=/work/courses/3dv/team32/hands-on-neoverse
 #SBATCH --output=/work/courses/3dv/team32/hands-on-neoverse/logs/multi_model_demo_%j.out
@@ -20,11 +19,6 @@
 #   bash demos/run_multi_model_demo.sh --no-share      # local link only
 #   sbatch demos/run_multi_model_demo.sh                # submit as a cluster job
 #
-# Any extra args are forwarded straight to the Python module.
-set -euo pipefail
-
-# Run from the repo root regardless of where the script is invoked.
-cd "$(dirname "$0")/.."
 
 mkdir -p logs outputs
 

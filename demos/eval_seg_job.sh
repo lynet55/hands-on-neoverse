@@ -16,10 +16,10 @@ source ./neoverse/bin/activate
 
 python -u eval_segmentation.py \
     --npz \
-        diffsynth/data/training_data/clip-001053.npz \
-        diffsynth/data/training_data/clip-001068.npz \
-        diffsynth/data/training_data/clip-001083.npz \
-        diffsynth/data/training_data/clip-001100.npz \
-        diffsynth/data/training_data/clip-001120.npz \
+        /work/courses/3dv/team32/training_data_modal/clip-001053.npz \
+        /work/courses/3dv/team32/training_data_modal/clip-001068.npz \
+        /work/courses/3dv/team32/training_data_modal/clip-001083.npz \
+        /work/courses/3dv/team32/training_data_modal/clip-001100.npz \
+        /work/courses/3dv/team32/training_data_modal/clip-001120.npz \
     --hand_head_path models/NeoVerse/hand_seg_model_opt_run20260426-130617_epoch004.ckpt \
     --output outputs/eval_seg.mp4

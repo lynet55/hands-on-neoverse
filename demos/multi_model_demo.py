@@ -34,7 +34,7 @@ Caching is two-level so the app stays interactive:
 
 Launch (public share link by default, loads models/ checkpoints by default):
     python -m demos.multi_model_demo
-    python -m demos.multi_model_demo --data_root diffsynth/data/training_data
+    python -m demos.multi_model_demo --data_root /work/courses/3dv/team32/training_data_modal
     python -m demos.multi_model_demo --low_vram --no-share
 """
 
@@ -52,7 +52,7 @@ from torchvision.transforms import functional as F
 
 from NeoVerse.diffsynth.models import ModelManager
 from NeoVerse.diffsynth import save_video
-from NeoVerse.diffsynth.utils.auxiliary import load_video, homo_matrix_inverse
+from NeoVerse.diffsynth.utils.auxiliary import homo_matrix_inverse
 from NeoVerse.diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
 
 # Reuse the benchmark's gs_mask loader and the eval visualisation helpers so this
@@ -79,14 +79,15 @@ parser.add_argument("--models_dir", default="models/NeoVerse",
                     help="Directory scanned for *.ckpt checkpoints (default: models/NeoVerse).")
 parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt",
                     help="Base reconstructor that head-only models (hand_seg, gs_mask) overlay onto.")
-parser.add_argument("--data_root", default="diffsynth/data/training_data",
+parser.add_argument("--data_root", default="/work/courses/3dv/team32/training_data_modal",
                     help="Directory of clip-*.npz files offered in the clip dropdown. "
                          "Falls back gracefully if empty — you can still upload a video.")
+parser.add_argument("--default_clip", default="clip-001053",
+                    help="Clip selected on startup (like the evals' default). Falls back to the "
+                         "first clip found under --data_root if this one is absent.")
 parser.add_argument("--stride", type=int, default=3, help="Frame stride (training default is 3).")
 parser.add_argument("--max_frames", type=int, default=8,
                     help="Cap on stride-sampled frames per render (keeps the app snappy).")
-parser.add_argument("--resolution", type=str, default="560x336",
-                    help="WxH for uploaded-video input (NPZ clips keep their native size).")
 parser.add_argument("--cache_size", type=int, default=8,
                     help="Max number of cached forward passes (GPU memory bound).")
 parser.add_argument("--low_vram", action="store_true",
@@ -96,7 +97,6 @@ parser.add_argument("--share", action=argparse.BooleanOptionalAction, default=Tr
 parser.add_argument("--server_port", type=int, default=7860)
 args, _ = parser.parse_known_args()
 
-RES_W, RES_H = (int(x) for x in args.resolution.split("x"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -238,7 +238,7 @@ def list_streams(clip: str | None) -> list[str]:
 
 
 def build_views_from_npz(clip: str, stream: str):
-    """Return (views, raw_pil_frames, npz, stream, frame_indices, W, H)."""
+    """Return (views, raw_pil_frames, W, H) for a clip/stream."""
     npz_path = Path(args.data_root) / f"{clip}.npz"
     npz = np.load(str(npz_path))
     images_np = npz[f"images_{stream}"]            # (T, H, W, 3) uint8
@@ -254,22 +254,14 @@ def build_views_from_npz(clip: str, stream: str):
         "timestamp": torch.arange(S, dtype=torch.int64, device=DEVICE).unsqueeze(0),
     }
     H, W = images_np.shape[1], images_np.shape[2]
-    return views, pil, npz, stream, frame_indices, W, H
+    return views, pil, W, H
 
 
-def build_views_from_video(video_path: str):
-    """Return (views, raw_pil_frames, None, None, None, W, H) for an uploaded video."""
-    pil = load_video(video_path, args.max_frames, resolution=(RES_W, RES_H),
-                     resize_mode="center_crop", static_scene=False)[: args.max_frames]
-    imgs = torch.stack([F.to_tensor(p) for p in pil], dim=0)
-    S = imgs.shape[0]
-    views = {
-        "img": imgs.unsqueeze(0).to(DEVICE),
-        "is_target": torch.zeros((1, S), dtype=torch.bool, device=DEVICE),
-        "is_static": torch.zeros((1, S), dtype=torch.bool, device=DEVICE),
-        "timestamp": torch.arange(S, dtype=torch.int64, device=DEVICE).unsqueeze(0),
-    }
-    return views, pil, None, None, None, RES_W, RES_H
+def default_clip(clips: list[str]) -> str | None:
+    """Pick the startup clip: the configured default if present, else the first."""
+    if not clips:
+        return None
+    return args.default_clip if args.default_clip in clips else clips[0]
 
 
 # ===================================================================== #
@@ -387,28 +379,21 @@ def render_model_frames(label, views, raw_pil, input_sig, classes, mode, W, H) -
 #                            MAIN CALLBACK                              #
 # ===================================================================== #
 
-def run(input_type, clip, stream, video_path, model_labels, class_choices, mode):
+def run(clip, stream, model_labels, class_choices, mode):
     if not model_labels:
         raise gr.Error("Select at least one model to render.")
 
-    # ---- build the shared input ----
-    if input_type == "NPZ clip":
-        if not clip:
-            raise gr.Error("Pick a clip from the dropdown (or switch to 'Upload video').")
-        if not stream:
-            streams = list_streams(clip)
-            if not streams:
-                raise gr.Error(f"No image streams found in {clip}.")
-            stream = streams[0]
-        views, raw_pil, npz, stream, frame_indices, W, H = build_views_from_npz(clip, stream)
-        input_sig = ("npz", clip, stream, args.stride, args.max_frames)
-        src_label = f"{clip}  {stream}"
-    else:
-        if not video_path:
-            raise gr.Error("Upload a video (or switch to 'NPZ clip').")
-        views, raw_pil, npz, stream, frame_indices, W, H = build_views_from_video(video_path)
-        input_sig = ("video", os.path.abspath(video_path), RES_W, RES_H, args.max_frames)
-        src_label = os.path.basename(video_path)
+    # ---- build the shared input from the selected clip/stream ----
+    if not clip:
+        raise gr.Error("No clip available — check --data_root contains clip-*.npz files.")
+    if not stream:
+        streams = list_streams(clip)
+        if not streams:
+            raise gr.Error(f"No image streams found in {clip}.")
+        stream = streams[0]
+    views, raw_pil, W, H = build_views_from_npz(clip, stream)
+    input_sig = ("npz", clip, stream, args.stride, args.max_frames)
+    src_label = f"{clip}  {stream}"
 
     classes = tuple(sorted(CLASS_NAMES.index(c) for c in class_choices)) if class_choices else ()
     if mode == "RGB render" and not classes:
@@ -452,6 +437,8 @@ def run(input_type, clip, stream, video_path, model_labels, class_choices, mode)
 
 def build_ui():
     clips = list_clips()
+    start_clip = default_clip(clips)
+    start_streams = list_streams(start_clip)
     default_models = list(CHECKPOINTS.keys())[: min(2, len(CHECKPOINTS))]
 
     with gr.Blocks(title="NeoVerse — Multi-Model Viewer") as demo:
@@ -466,17 +453,10 @@ def build_ui():
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_type = gr.Radio(
-                    ["NPZ clip", "Upload video"],
-                    value="NPZ clip" if clips else "Upload video",
-                    label="Input source",
-                )
-                clip_dd = gr.Dropdown(clips, value=(clips[0] if clips else None),
-                                      label="Clip (clip-*.npz)", visible=bool(clips))
-                stream_dd = gr.Dropdown(list_streams(clips[0] if clips else None),
-                                        value=(list_streams(clips[0])[0] if clips and list_streams(clips[0]) else None),
-                                        label="Stream", visible=bool(clips))
-                video_in = gr.Video(label="Upload video", sources=["upload"], visible=not clips)
+                clip_dd = gr.Dropdown(clips, value=start_clip, label="Clip (clip-*.npz)")
+                stream_dd = gr.Dropdown(start_streams,
+                                        value=(start_streams[0] if start_streams else None),
+                                        label="Stream")
 
                 model_sel = gr.CheckboxGroup(
                     list(CHECKPOINTS.keys()), value=default_models,
@@ -496,13 +476,6 @@ def build_ui():
             with gr.Column(scale=2):
                 out_video = gr.Video(label="Input | model renders (side-by-side)", height=460)
 
-        # Toggle input widgets with the source radio.
-        def _toggle_source(t):
-            is_npz = t == "NPZ clip"
-            return (gr.update(visible=is_npz), gr.update(visible=is_npz),
-                    gr.update(visible=not is_npz))
-        input_type.change(_toggle_source, input_type, [clip_dd, stream_dd, video_in])
-
         # Repopulate streams when the clip changes.
         def _on_clip(c):
             streams = list_streams(c)
@@ -511,7 +484,7 @@ def build_ui():
 
         run_btn.click(
             run,
-            inputs=[input_type, clip_dd, stream_dd, video_in, model_sel, class_sel, mode_sel],
+            inputs=[clip_dd, stream_dd, model_sel, class_sel, mode_sel],
             outputs=[out_video, info_box],
         )
 

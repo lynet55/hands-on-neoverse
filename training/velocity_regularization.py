@@ -67,7 +67,7 @@ class SequenceHandObjectDataset(HandObjectSegmentationDataset):
 
     def __init__(
         self,
-        data_root: str = "diffsynth/data/training_data_modal",
+        data_root: str = "/work/courses/3dv/team32/training_data_modal",
         num_key_frames: int = 4,
         frame_stride: int = 1,
         random_reverse: bool = True,

@@ -86,7 +86,7 @@ def render_mask_labels(reconstructor, predictions, width, height):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--npz", nargs="+",
-                        default=["diffsynth/data/training_data/clip-001053.npz"])
+                        default=["/work/courses/3dv/team32/training_data_modal/clip-001053.npz"])
     parser.add_argument("--reconstructor_path",
                         default="models/NeoVerse/reconstructor.ckpt",
                         help="Base reconstructor the gs_mask head is overlaid onto.")

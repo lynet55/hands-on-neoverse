@@ -19,7 +19,7 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        data_root: str = "diffsynth/data/training_data",
+        data_root: str = "/work/courses/3dv/team32/training_data_modal",
         streams: list[str] = None,
     ):
         self.data_root = Path(data_root)

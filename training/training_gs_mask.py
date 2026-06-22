@@ -490,14 +490,14 @@ def train():
     model.set_train_mode()
 
     # Dataset split
-    all_clips = sorted(p.stem for p in Path("diffsynth/data/training_data").glob("clip-*.npz"))
+    all_clips = sorted(p.stem for p in Path("/work/courses/3dv/team32/training_data_modal").glob("clip-*.npz"))
     n_val = max(1, int(len(all_clips) * cfg.val_fraction))
     val_clips = set(all_clips[-n_val:])
     train_clips = set(all_clips[:-n_val])
     dbg(f"Clips: {len(all_clips)} total → {len(train_clips)} train / {len(val_clips)} val")
 
-    train_ds = StridedHandObjectDataset("diffsynth/data/training_data", cfg.frame_stride, clip_names=train_clips)
-    val_ds   = StridedHandObjectDataset("diffsynth/data/training_data", cfg.frame_stride, clip_names=val_clips)
+    train_ds = StridedHandObjectDataset("/work/courses/3dv/team32/training_data_modal", cfg.frame_stride, clip_names=train_clips)
+    val_ds   = StridedHandObjectDataset("/work/courses/3dv/team32/training_data_modal", cfg.frame_stride, clip_names=val_clips)
     dbg(f"Samples: {len(train_ds)} train / {len(val_ds)} val")
 
     train_loader = DataLoader(train_ds, sampler=ClipStreamSampler(train_ds, shuffle_clips=True),

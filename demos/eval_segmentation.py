@@ -7,7 +7,7 @@ Outputs:
 
 Usage:
     python eval_segmentation.py \
-        --npz diffsynth/data/training_data/clip-001053.npz \
+        --npz /work/courses/3dv/team32/training_data_modal/clip-001053.npz \
         --hand_head_path models/NeoVerse/hand_seg_model_opt_run20260426-130617_epoch004.ckpt
 """
 
@@ -93,7 +93,7 @@ def compute_iou(pred: np.ndarray, gt: np.ndarray, n_classes: int = 4):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--npz", nargs="+",
-                        default=["diffsynth/data/training_data/clip-001053.npz"])
+                        default=["/work/courses/3dv/team32/training_data_modal/clip-001053.npz"])
     parser.add_argument("--reconstructor_path",
                         default="models/NeoVerse/reconstructor.ckpt")
     parser.add_argument("--hand_head_path",

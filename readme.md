@@ -23,7 +23,7 @@ benchmarks, demos) sit in the top-level folders described below.
 | --- | --- | --- |
 | `multi_model_demo.py` | **Interactive multi-model viewer** — loads all three trained heads (`hand_seg`, `gs_mask`, `vel_reg`) plus the base reconstructor, renders any subset side-by-side on the same clip, with checkboxes to toggle which classes (left/right hand, object, background) are rendered and a segmentation-overlay mode. Caches forward passes and renders so toggling stays snappy; shares a public link by default. | `bash demos/run_multi_model_demo.sh` |
 | `eval_segmentation.py` | Scores the 2D `hand_pred_head` on one NPZ clip and writes an `input \| prediction \| ground-truth` video. | `sbatch demos/eval_seg_job.sh` |
-| `eval_segmentation_gs_mask.py` | Same evaluation but for the per-Gaussian `gs_mask` head — scores the rasterized mask channels instead of the 2D head. | `python -m demos.eval_segmentation_gs_mask --npz diffsynth/data/training_data/clip-001053.npz --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt` |
+| `eval_segmentation_gs_mask.py` | Same evaluation but for the per-Gaussian `gs_mask` head — scores the rasterized mask channels instead of the 2D head. | `python -m demos.eval_segmentation_gs_mask --npz /work/courses/3dv/team32/training_data_modal/clip-000157.npz --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt` |
 | `reconstruction_demo.py` | Reconstruction-only Gradio app (~1–2 GB VRAM, no diffusion model). | `python -m demos.reconstruction_demo --low_vram` |
 | `reconstruction_compare_demo.py` | Renders one window with one or two reconstructors next to the ground truth, annotated with per-frame PSNR/SSIM. | `python -m demos.reconstruction_compare_demo` |
 | `interpolation_compare_demo.py` | Hides the odd frames of a window and compares how each model reconstructs them via the velocity field. | `python -m demos.interpolation_compare_demo` |
@@ -32,14 +32,23 @@ benchmarks, demos) sit in the top-level folders described below.
 Example outputs below (reduced from [`outputs/`](outputs/); full-res artifacts live there).
 Each is captioned with the script that produced it and the file it writes.
 
+**`multi_model_demo.py`** → interactive Gradio app, side-by-side renders of any selected checkpoints
+
+```bash
+bash demos/run_multi_model_demo.sh
+```
+
+![Multi-model viewer from multi_model_demo.py](readme/multi_model_demo.png)
+
 **`eval_segmentation_gs_mask.py`** → `outputs/eval_seg_gs_mask_<clip>.mp4` (`input | prediction | ground truth`)
 
 ```bash
-python -m demos.eval_segmentation_gs_mask --npz diffsynth/data/training_data/clip-001053.npz \
+python -m demos.eval_segmentation_gs_mask --npz /work/courses/3dv/team32/training_data_modal/clip-000157.npz \
     --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt
 ```
 
-![Segmentation eval from eval_segmentation_gs_mask.py](res/readme/eval_seg_gs_mask_clip-001053.gif)
+<img src="readme/eval_seg_gs_mask_clip-000157.gif" alt="Segmentation eval from eval_segmentation_gs_mask.py" width="760">
+
 
 **`reconstruction_compare_demo.py`** → `outputs/recon_demo/<clip>_<stream>_w<N>/comparison.png`
 
@@ -47,7 +56,7 @@ python -m demos.eval_segmentation_gs_mask --npz diffsynth/data/training_data/cli
 python -m demos.reconstruction_compare_demo
 ```
 
-![Reconstruction comparison from reconstruction_compare_demo.py](res/readme/reconstruction_compare.png)
+![Reconstruction comparison from reconstruction_compare_demo.py](readme/reconstruction_compare.png)
 
 **`interpolation_compare_demo.py`** → `outputs/interp_demo/<clip>_<stream>_w<N>/interpolation_comparison.png`
 
@@ -55,7 +64,7 @@ python -m demos.reconstruction_compare_demo
 python -m demos.interpolation_compare_demo
 ```
 
-![Interpolation comparison from interpolation_compare_demo.py](res/readme/interpolation_compare.png)
+![Interpolation comparison from interpolation_compare_demo.py](readme/interpolation_compare.png)
 
 **`interpolation_velocity_regions_demo.py`** → `outputs/interp_velocity_regions/<clip>_<stream>/velocity_poster.png`
 
@@ -63,7 +72,7 @@ python -m demos.interpolation_compare_demo
 python -m demos.interpolation_velocity_regions_demo
 ```
 
-![Velocity-region poster from interpolation_velocity_regions_demo.py](res/readme/velocity_poster.png)
+![Velocity-region poster from interpolation_velocity_regions_demo.py](readme/velocity_poster.png)
 
 ### `evals/`
 

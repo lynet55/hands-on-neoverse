@@ -202,6 +202,7 @@ def load_model(label: str) -> torch.nn.Module:
         rec = WorldMirror(enable_norm=False)
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         rec.load_state_dict(ckpt["model_state_dict"], strict=False)
+        rec = rec.to(device=target, dtype=DTYPE).eval()
     else:
         rec = _load_base_reconstructor()
         if kind == "hand_seg":
@@ -210,7 +211,11 @@ def load_model(label: str) -> torch.nn.Module:
             load_gs_mask_head(rec, path, target)
         # kind == "reconstructor": base only, nothing to overlay.
 
-    rec = rec.to(device=target, dtype=DTYPE).eval()
+        # Device-only move: the base reconstructor is already DTYPE from
+        # _load_base_reconstructor, and the overlays above deliberately keep
+        # their heads in fp32 (matching training/eval) — casting the whole
+        # model to DTYPE here would silently undo that.
+        rec = rec.to(target).eval()
     _MODELS[label] = rec
     print(f"  '{label}' ready on {target}.", flush=True)
     return rec

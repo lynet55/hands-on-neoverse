@@ -28,4 +28,4 @@ module add cuda/12.8
 source ./neoverse/bin/activate
 
 # share=True by default -> prints a public share link the user can open anywhere.
-python -u -m demos.multi_model_demo "$@"
+python -u -m demos.multi_model_demo --data_root demo_data "$@"

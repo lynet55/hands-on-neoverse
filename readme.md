@@ -16,71 +16,62 @@ benchmarks, demos) sit in the top-level folders described below.
 - **`evals/`** — quantitative benchmarks that score a model over a validation split (PSNR/SSIM/LPIPS for rendering, mIoU/IoU/accuracy/boundary-F1 for segmentation).
 - **`hot3d/`** — the HOT3D data pipeline: download clips, extract images, render MANO hand/object masks, and pack everything into the per-clip NPZ training files.
 - **`training/`** — training entry points for the heads we added on top of the frozen reconstructor (hand segmentation, per-Gaussian mask, velocity regularization).
+- **`demo_data/`** — a small bundled sample clip so the demos and evals below work out of the box, without access to the student cluster.
+
+### `demo_data/`
+
+The demo/eval scripts default to the student cluster's dataset at
+`/work/courses/3dv/team32/training_data_modal/`, which isn't reachable outside
+that cluster. `demo_data/clip-000592.npz` is a single representative clip
+(two streams, with hand/object masks) checked into the repo so you can run any
+of the commands below — and try the interactive viewer — without that path.
+All commands in this README already point at it; pass your own `--npz` /
+`--data_root` instead if you do have cluster access and want the full
+validation split.
 
 ### `demos/`
 
-| Script | What it does | Run |
-| --- | --- | --- |
-| `multi_model_demo.py` | **Interactive multi-model viewer** — loads all three trained heads (`hand_seg`, `gs_mask`, `vel_reg`) plus the base reconstructor, renders any subset side-by-side on the same clip, with checkboxes to toggle which classes (left/right hand, object, background) are rendered and a segmentation-overlay mode. Caches forward passes and renders so toggling stays snappy; shares a public link by default. | `bash demos/run_multi_model_demo.sh` |
-| `eval_segmentation.py` | Scores the 2D `hand_pred_head` on one NPZ clip and writes an `input \| prediction \| ground-truth` video. | `sbatch demos/eval_seg_job.sh` |
-| `eval_segmentation_gs_mask.py` | Same evaluation but for the per-Gaussian `gs_mask` head — scores the rasterized mask channels instead of the 2D head. | `python -m demos.eval_segmentation_gs_mask --npz /work/courses/3dv/team32/training_data_modal/clip-000157.npz --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt` |
-| `reconstruction_demo.py` | Reconstruction-only Gradio app (~1–2 GB VRAM, no diffusion model). | `python -m demos.reconstruction_demo --low_vram` |
-| `reconstruction_compare_demo.py` | Renders one window with one or two reconstructors next to the ground truth, annotated with per-frame PSNR/SSIM. | `python -m demos.reconstruction_compare_demo` |
-| `interpolation_compare_demo.py` | Hides the odd frames of a window and compares how each model reconstructs them via the velocity field. | `python -m demos.interpolation_compare_demo` |
-| `interpolation_velocity_regions_demo.py` | Variant that splits the predicted velocity field into the four segmentation regions and characterises each one separately. | `python -m demos.interpolation_velocity_regions_demo` |
+| Script | What it does |
+| --- | --- |
+| `multi_model_demo.py` | **Interactive multi-model viewer** — loads all three trained heads (`hand_seg`, `gs_mask`, `vel_reg`) plus the base reconstructor, renders any subset side-by-side on the same clip, with checkboxes to toggle which classes (left/right hand, object, background) are rendered and a segmentation-overlay mode. Caches forward passes and renders so toggling stays snappy; shares a public link by default. |
+| `eval_segmentation.py` | Scores the 2D `hand_pred_head` on one NPZ clip and writes an `input \| prediction \| ground-truth` video. |
+| `eval_segmentation_gs_mask.py` | Same evaluation but for the per-Gaussian `gs_mask` head — scores the rasterized mask channels instead of the 2D head. |
+| `reconstruction_demo.py` | Reconstruction-only Gradio app (~1–2 GB VRAM, no diffusion model). |
+| `reconstruction_compare_demo.py` | Renders one window with one or two reconstructors next to the ground truth, annotated with per-frame PSNR/SSIM. |
+| `interpolation_compare_demo.py` | Hides the odd frames of a window and compares how each model reconstructs them via the velocity field. |
+| `interpolation_velocity_regions_demo.py` | Variant that splits the predicted velocity field into the four segmentation regions and characterises each one separately. |
 
 Example outputs below (reduced from [`outputs/`](outputs/); full-res artifacts live there).
 Each is captioned with the script that produced it and the file it writes.
 
 **`multi_model_demo.py`** → interactive Gradio app, side-by-side renders of any selected checkpoints
 
-```bash
-bash demos/run_multi_model_demo.sh
-```
-
 ![Multi-model viewer from multi_model_demo.py](readme/multi_model_demo.png)
 
 **`eval_segmentation_gs_mask.py`** → `outputs/eval_seg_gs_mask_<clip>.mp4` (`input | prediction | ground truth`)
 
-```bash
-python -m demos.eval_segmentation_gs_mask --npz /work/courses/3dv/team32/training_data_modal/clip-000157.npz \
-    --gs_mask_head_path models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt
-```
-
-<img src="readme/eval_seg_gs_mask_clip-000157.gif" alt="Segmentation eval from eval_segmentation_gs_mask.py" width="760">
+<img src="readme/eval_seg_gs_mask_clip-001053.gif" alt="Segmentation eval from eval_segmentation_gs_mask.py" width="760">
 
 
 **`reconstruction_compare_demo.py`** → `outputs/recon_demo/<clip>_<stream>_w<N>/comparison.png`
-
-```bash
-python -m demos.reconstruction_compare_demo
-```
 
 ![Reconstruction comparison from reconstruction_compare_demo.py](readme/reconstruction_compare.png)
 
 **`interpolation_compare_demo.py`** → `outputs/interp_demo/<clip>_<stream>_w<N>/interpolation_comparison.png`
 
-```bash
-python -m demos.interpolation_compare_demo
-```
-
 ![Interpolation comparison from interpolation_compare_demo.py](readme/interpolation_compare.png)
 
 **`interpolation_velocity_regions_demo.py`** → `outputs/interp_velocity_regions/<clip>_<stream>/velocity_poster.png`
-
-```bash
-python -m demos.interpolation_velocity_regions_demo
-```
 
 ![Velocity-region poster from interpolation_velocity_regions_demo.py](readme/velocity_poster.png)
 
 ### `evals/`
 
-| Script | What it does | Run |
-| --- | --- | --- |
-| `benchmark_rec.py` | Current reconstruction + segmentation benchmark; supports `--mode reconstruction` and `--mode seg_compare` (hand_seg vs gs_mask). | `sbatch evals/benchmark_rec.sh` (reconstruction) or `sbatch evals/benchmark_seg_compare.sh` (head comparison) |
-| `benchmark.py` | Older single-model reconstruction + segmentation benchmark. | `sbatch evals/jobscript.sh` |
-| `bechmark_interpolation.py` | Keyframe-interpolation rendering core (held-out in-between frames). Not run directly — imported by `benchmark_rec.py` and the interpolation demos. | _(library module)_ |
+| Script | What it does |
+| --- | --- |
+| `benchmark_rec.py` | Current reconstruction + segmentation benchmark; supports `--mode reconstruction` and `--mode seg_compare` (hand_seg vs gs_mask). |
+| `benchmark.py` | Older single-model reconstruction + segmentation benchmark. |
+| `bechmark_interpolation.py` | Keyframe-interpolation rendering core (held-out in-between frames). Not run directly — imported by `benchmark_rec.py` and the interpolation demos. |
 
 These benchmarks emit **numeric** artifacts, not figures. `benchmark_rec.py`
 writes per-run JSON/CSV under `runs/benchmarks/` (`config.json`,
@@ -90,25 +81,25 @@ visual comparisons, use the demos above.
 
 ### `hot3d/`
 
-| Script | What it does | Run |
-| --- | --- | --- |
-| `optimized_download.py` | Downloads and pre-processes HOT3D clips into per-clip `clip-XXXXXX.npz` files (images + hand/object masks). | `python -m hot3d.optimized_download` |
-| `extract_images.py` | Extracts per-stream images from a clip tar. | `python -m hot3d.extract_images` |
-| `make_masks.py` | Renders MANO hand/object segmentation masks for a clip. | `python -m hot3d.make_masks` |
-| `extract_training_data.py` | Packs extracted images + masks into NPZ and writes ready-sentinels for the dataset to ingest. | `python -m hot3d.extract_training_data` |
-| `SimpleExtractTrainingData.py` | Simplified single-process variant of the training-data extractor. | `python -m hot3d.SimpleExtractTrainingData` |
-| `precompute_features.py` | Pre-extracts frozen-backbone features to disk so training can skip the backbone (~85% of step time). | `python -m hot3d.precompute_features --data_root diffsynth/data/training_data --output_dir diffsynth/data/training_features --model_path models/NeoVerse/reconstructor.ckpt` |
-| `dataloader.py` | Minimal WebDataset sanity-check over a HOT3D shard. | `python -m hot3d.dataloader` |
+| Script | What it does |
+| --- | --- |
+| `optimized_download.py` | Downloads and pre-processes HOT3D clips into per-clip `clip-XXXXXX.npz` files (images + hand/object masks). |
+| `extract_images.py` | Extracts per-stream images from a clip tar. |
+| `make_masks.py` | Renders MANO hand/object segmentation masks for a clip. |
+| `extract_training_data.py` | Packs extracted images + masks into NPZ and writes ready-sentinels for the dataset to ingest. |
+| `SimpleExtractTrainingData.py` | Simplified single-process variant of the training-data extractor. |
+| `precompute_features.py` | Pre-extracts frozen-backbone features to disk so training can skip the backbone (~85% of step time). |
+| `dataloader.py` | Minimal WebDataset sanity-check over a HOT3D shard. |
 
 
 
 ### `training/`
 
-| Script | What it does | Run |
-| --- | --- | --- |
-| `hand_pred.py` | Trains the 2D `hand_pred_head` segmentation head (backbone + other heads frozen). | `sbatch training/train_classificationHead.sh` |
-| `gs_mask.py` | Trains per-Gaussian mask logits, rendered through the rasterizer and supervised against GT masks (only the `gs_head` trains). | `sbatch training/train_gs_mask.sh` |
-| `velocity_regularization.py` | Regularizes background (class 3) Gaussians toward ~0 velocity while leaving hand/object velocity free, using the frozen model as a teacher. | `sbatch training/train_vel_reg.sh` |
+| Script | What it does |
+| --- | --- |
+| `hand_pred.py` | Trains the 2D `hand_pred_head` segmentation head (backbone + other heads frozen). |
+| `gs_mask.py` | Trains per-Gaussian mask logits, rendered through the rasterizer and supervised against GT masks (only the `gs_head` trains). |
+| `velocity_regularization.py` | Regularizes background (class 3) Gaussians toward ~0 velocity while leaving hand/object velocity free, using the frozen model as a teacher. |
 
 These scripts emit checkpoints to `models/NeoVerse/` and TensorBoard logs to
 `runs/`, not figures. To visualize a trained checkpoint, point one of the demos
@@ -120,31 +111,29 @@ To generate the hand masks for the training dataset a MANO model has to be added
 
 # How to run
 
-To run the evals and the demos, one of our trained models has to be loaded. The
-checkpoints are included in this repository under `models/NeoVerse/` (so they are
-already in place after cloning):
+To run the evals and the demos, one of our trained models has to be loaded.
+The checkpoints are **not** checked into this repository (they're large
+binaries) — download them from this Google Drive folder and place them under
+`models/NeoVerse/`:
+
+https://drive.google.com/drive/folders/183rOFuzXktHSEm_RtkVwjAZ4zQlC9Pp_?usp=sharing
 
 - `models/NeoVerse/reconstructor.ckpt` — base reconstructor
-- `models/NeoVerse/hand_seg_model_opt_best.ckpt` — 2D hand segmentation head
+- `models/NeoVerse/hand_seg_model_opt_latest.ckpt` — 2D hand segmentation head
 - `models/NeoVerse/gs_mask_model_run20260510-175056_epoch006.ckpt` — per-Gaussian mask model
-- `models/NeoVerse/velocity_regularization_20260604-001953_epoch1_step20099.ckpt` — velocity-regularized model
-
-You can also browse them on GitHub:
-https://github.com/lynet55/hands-on-neoverse/tree/main/models/NeoVerse
+- `models/NeoVerse/velocity_regularization_20260603-223749_epoch1_step20898.ckpt` — velocity-regularized model
 
 The simplest way to check out the models is to launch the **interactive
 multi-model viewer**, which loads the checkpoints under `models/NeoVerse/` by
 default, renders any subset of them side-by-side on the same clip, and lets you
 toggle which classes (left/right hand, object, background) are rendered — all in
-the browser. Run it on a GPU node; it prints a public share link by default:
-
-```bash
-bash demos/run_multi_model_demo.sh
-```
+the browser. Run it on a GPU node; it prints a public share link by default.
+Point it at the bundled `demo_data/` sample clip so it works without cluster
+access.
 
 The app caches forward passes and renders, so flipping the class toggles or
 swapping render modes re-renders quickly. For a single-checkpoint reconstruction
-view there is also `python -m demos.reconstruction_demo --low_vram`.
+view there is also `reconstruction_demo.py`.
 
 These scripts target the student cluster (SLURM) with a CUDA 12.8 toolchain.
 Create and populate the `neoverse` virtualenv once, then submit the job scripts.
@@ -162,11 +151,10 @@ source ./neoverse/bin/activate
 bash NeoVerse/setup.sh
 ```
 
-After that, run any task by submitting its SLURM script, e.g.
-`sbatch training/train_vel_reg.sh`. Each script re-loads `cuda/12.8` and
-`source ./neoverse/bin/activate`, so the venv and CUDA module must exist and
-match. To run a script interactively instead, activate the venv and invoke the
-Python module directly (see the **Run** columns above).
+After that, run any task by submitting its SLURM script. Each script re-loads
+`cuda/12.8` and `source ./neoverse/bin/activate`, so the venv and CUDA module
+must exist and match. To run a script interactively instead, activate the venv
+and invoke the Python module directly.
 
 # Docs
 

@@ -64,7 +64,11 @@ from demos.eval_segmentation import (
     add_caption,
     add_legend,
 )
-from demos.eval_segmentation_gs_mask import render_mask_labels
+
+# gs_mask's mask channels were trained/validated in a per-frame STATIC regime
+# (is_static=True, timestamp=0, is_inference=False) — see gs_mask_demo.py. This
+# batch size mirrors that script's default for chunking the per-frame forward passes.
+GS_MASK_BATCH_SIZE = 4
 
 
 # ===================================================================== #
@@ -248,7 +252,20 @@ def build_views_from_npz(clip: str, stream: str):
     npz = np.load(str(npz_path))
     images_np = npz[f"images_{stream}"]            # (T, H, W, 3) uint8
     T = images_np.shape[0]
-    frame_indices = list(range(0, T, args.stride))[: args.max_frames]
+    # Sample max_frames spread *across the whole clip*, not just the first few.
+    # The gs_mask overlay is rasterized from the reconstructed 3D scene, so it
+    # needs viewpoint diversity to come out clean; taking the leading
+    # `max_frames` stride samples (a sub-second window with almost no camera
+    # baseline) collapses the reconstruction and the masks render noisy. The
+    # full-clip evals don't hit this because they feed every stride frame.
+    strided = list(range(0, T, args.stride))
+    if len(strided) > args.max_frames:
+        sel = np.unique(
+            np.linspace(0, len(strided) - 1, args.max_frames).round().astype(int)
+        )
+        frame_indices = [strided[i] for i in sel]
+    else:
+        frame_indices = strided
     pil = [Image.fromarray(images_np[i]) for i in frame_indices]
     imgs = torch.stack([F.to_tensor(p) for p in pil], dim=0)   # (S, 3, H, W)
     S = imgs.shape[0]
@@ -291,6 +308,53 @@ def _evict_predictions():
 
 
 @torch.no_grad()
+def _forward_gs_mask_static(rec, views: dict) -> dict:
+    """Run gs_mask in its trained regime: each frame as its own 1-frame static
+    sequence (is_static=True, timestamp=0, is_inference=False), chunked by
+    GS_MASK_BATCH_SIZE. Mirrors gs_mask_demo.predict_gs_params_labels — feeding
+    gs_mask the shared multi-frame is_inference=True sequence instead routes its
+    mask channels through the 4DGS motion path they were never trained on.
+
+    Unlike the shared regime (one merged dynamic field for the whole clip), here
+    every frame gets its own independent Gaussian field, so the returned
+    "splats"/"rendered_extrinsics"/"rendered_intrinsics"/"rendered_timestamps"
+    are all indexed per-frame (length S) rather than per-batch-element.
+    """
+    imgs = views["img"][0]            # [S, 3, H, W]
+    S = imgs.shape[0]
+    splats, c2ws, Ks, tss = [], [], [], []
+    for start in range(0, S, GS_MASK_BATCH_SIZE):
+        chunk = imgs[start:start + GS_MASK_BATCH_SIZE]
+        b = chunk.shape[0]
+        frame_views = {
+            "img": chunk.unsqueeze(1).to(DEVICE, non_blocking=True),   # [b, 1, 3, H, W]
+            "is_target": torch.zeros((b, 1), dtype=torch.bool, device=DEVICE),
+            "is_static": torch.ones((b, 1), dtype=torch.bool, device=DEVICE),
+            "timestamp": torch.zeros((b, 1), dtype=torch.int64, device=DEVICE),
+        }
+        with torch.amp.autocast("cuda", dtype=DTYPE, enabled=(DEVICE == "cuda")):
+            preds = rec(frame_views, is_inference=False, use_motion=False)
+        for j in range(b):
+            # Make the per-class toggle reflect this model's *per-Gaussian*
+            # segmentation: overwrite each Gaussian's seg_label with its
+            # mask_logits argmax (otherwise render_classes would filter on the
+            # untrained 2D hand head).
+            for gs in preds["splats"][j]:
+                if getattr(gs, "mask_logits", None) is not None:
+                    gs.seg_label = gs.mask_logits.float().argmax(dim=-1).to(torch.int64)
+            splats.append(preds["splats"][j])
+            c2ws.append(preds["rendered_extrinsics"][j, 0])
+            Ks.append(preds["rendered_intrinsics"][j, 0])
+            tss.append(preds["rendered_timestamps"][j, 0])
+    return {
+        "splats": splats,                          # list[S] of per-frame Gaussian chunk-lists
+        "rendered_extrinsics": torch.stack(c2ws),  # [S, 4, 4]
+        "rendered_intrinsics": torch.stack(Ks),    # [S, 3, 3]
+        "rendered_timestamps": torch.stack(tss),   # [S]
+    }
+
+
+@torch.no_grad()
 def get_predictions(label: str, views: dict, input_sig: tuple) -> dict:
     """Forward pass for one model on one input, memoised on (model, input)."""
     key = (label, input_sig)
@@ -303,20 +367,15 @@ def get_predictions(label: str, views: dict, input_sig: tuple) -> dict:
     if args.low_vram:
         rec.to(DEVICE)
     try:
-        with torch.amp.autocast("cuda", dtype=DTYPE, enabled=(DEVICE == "cuda")):
-            predictions = rec(views, is_inference=True, use_motion=False)
+        if kind == "gs_mask":
+            predictions = _forward_gs_mask_static(rec, views)
+        else:
+            with torch.amp.autocast("cuda", dtype=DTYPE, enabled=(DEVICE == "cuda")):
+                predictions = rec(views, is_inference=True, use_motion=False)
     finally:
         if args.low_vram:
             rec.to("cpu")
             torch.cuda.empty_cache()
-
-    # For gs_mask, make the per-class toggle reflect this model's *per-Gaussian*
-    # segmentation: overwrite each Gaussian's seg_label with its mask_logits argmax.
-    # (Otherwise render_classes filters on the untrained 2D hand head.)
-    if kind == "gs_mask":
-        for gs in predictions["splats"][0]:
-            if getattr(gs, "mask_logits", None) is not None:
-                gs.seg_label = gs.mask_logits.float().argmax(dim=-1).to(torch.int64)
 
     _PRED_CACHE[key] = predictions
     _evict_predictions()
@@ -324,16 +383,34 @@ def get_predictions(label: str, views: dict, input_sig: tuple) -> dict:
 
 
 @torch.no_grad()
-def render_rgb_frames(rec, predictions, classes: tuple[int, ...], W: int, H: int) -> list[Image.Image]:
+def render_rgb_frames(rec, predictions, kind: str, classes: tuple[int, ...],
+                      W: int, H: int) -> list[Image.Image]:
     """Rasterize RGB at the input cameras, keeping only the selected classes."""
+    # All four selected → pass None (no filtering = full scene).
+    render_classes = None if len(classes) == 4 else list(classes)
+
+    if kind == "gs_mask":
+        # Each frame has its own independent Gaussian field (per-frame static
+        # regime) — rasterize one frame at a time instead of one merged call.
+        splats = predictions["splats"]
+        c2w, K, ts = (predictions["rendered_extrinsics"],
+                      predictions["rendered_intrinsics"], predictions["rendered_timestamps"])
+        frames = []
+        for s in range(len(splats)):
+            w2c = homo_matrix_inverse(c2w[s:s + 1])
+            rgb, _, _, _ = rec.gs_renderer.rasterizer.forward(
+                [splats[s]], render_viewmats=[w2c], render_Ks=[K[s:s + 1]],
+                render_timestamps=[ts[s:s + 1]], sh_degree=0, width=W, height=H,
+                render_classes=render_classes,
+            )
+            frames.append(Image.fromarray((rgb[0, 0].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()))
+        return frames
+
     gaussians = predictions["splats"]
     c2w = predictions["rendered_extrinsics"][0]
     K = predictions["rendered_intrinsics"][0]
     ts = predictions["rendered_timestamps"][0]
     w2c = homo_matrix_inverse(c2w)
-
-    # All four selected → pass None (no filtering = full scene).
-    render_classes = None if len(classes) == 4 else list(classes)
     rgb, _, _, _ = rec.gs_renderer.rasterizer.forward(
         gaussians, render_viewmats=[w2c], render_Ks=[K], render_timestamps=[ts],
         sh_degree=0, width=W, height=H, render_classes=render_classes,
@@ -345,13 +422,34 @@ def render_rgb_frames(rec, predictions, classes: tuple[int, ...], W: int, H: int
 
 
 @torch.no_grad()
+def _render_gs_mask_seg_frames(rec, predictions, raw_pil, W: int, H: int) -> list[Image.Image]:
+    """Per-frame mask rasterization for gs_mask's independent per-frame fields."""
+    splats = predictions["splats"]
+    c2w, K, ts = (predictions["rendered_extrinsics"],
+                  predictions["rendered_intrinsics"], predictions["rendered_timestamps"])
+    frames = []
+    for s in range(len(splats)):
+        w2c = homo_matrix_inverse(c2w[s:s + 1])
+        _, _, _, masks = rec.gs_renderer.rasterizer.forward(
+            [splats[s]], render_viewmats=[w2c], render_Ks=[K[s:s + 1]],
+            render_timestamps=[ts[s:s + 1]], sh_degree=0, width=W, height=H,
+            render_classes=[0, 1, 2, 3],
+        )
+        if masks is None:
+            raise gr.Error("Rasterizer returned no mask logits — the loaded gs_head "
+                            "has no trained mask channels.")
+        label = masks[0, 0].float().argmax(dim=-1).cpu().numpy()
+        frames.append(overlay_label(raw_pil[s], label))
+    return frames
+
+
+@torch.no_grad()
 def render_seg_frames(rec, predictions, kind: str, raw_pil, W: int, H: int) -> list[Image.Image]:
     """Segmentation overlay on the input frames (model's own segmentation source)."""
     if kind == "gs_mask":
-        labels = render_mask_labels(rec, predictions, width=W, height=H)   # [S,H,W]
-    else:
-        # hand_seg / reconstructor / vel_reg: the 2D hand_pred_head output.
-        labels = predictions["seg_labels"][0].float().argmax(dim=-1).cpu().numpy()
+        return _render_gs_mask_seg_frames(rec, predictions, raw_pil, W, H)
+    # hand_seg / reconstructor / vel_reg: the 2D hand_pred_head output.
+    labels = predictions["seg_labels"][0].float().argmax(dim=-1).cpu().numpy()
     return [overlay_label(raw_pil[i], labels[i]) for i in range(len(raw_pil))]
 
 
@@ -372,7 +470,7 @@ def render_model_frames(label, views, raw_pil, input_sig, classes, mode, W, H) -
     if mode == "Segmentation overlay":
         frames = render_seg_frames(rec, predictions, kind, raw_pil, W, H)
     else:
-        frames = render_rgb_frames(rec, predictions, classes, W, H)
+        frames = render_rgb_frames(rec, predictions, kind, classes, W, H)
 
     _RENDER_CACHE[key] = frames
     while len(_RENDER_CACHE) > 4 * args.cache_size:
@@ -413,8 +511,13 @@ def run(clip, stream, model_labels, class_choices, mode):
         tag = mode if mode == "Segmentation overlay" else "+".join(CLASS_NAMES[i] for i in classes)
         captioned = [add_caption(f, f"{label.split('  [')[0]}  ·  {tag}") for f in frames]
         columns.append(captioned)
-        n_gauss = sum(gs.means.shape[0]
-                      for gs in get_predictions(label, views, input_sig)["splats"][0])
+        preds = get_predictions(label, views, input_sig)
+        if CHECKPOINTS[label]["kind"] == "gs_mask":
+            # "splats" is per-frame here (one independent field per frame),
+            # not per-batch-element — sum across all of them.
+            n_gauss = sum(gs.means.shape[0] for frame_splats in preds["splats"] for gs in frame_splats)
+        else:
+            n_gauss = sum(gs.means.shape[0] for gs in preds["splats"][0])
         info_lines.append(f"{label}: {n_gauss:,} gaussians")
 
     # ---- stitch all columns into one side-by-side video ----

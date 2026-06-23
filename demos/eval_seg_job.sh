@@ -14,12 +14,12 @@ module add cuda/12.8
 
 source ./neoverse/bin/activate
 
-python -u eval_segmentation.py \
+python -u -m demos.eval_segmentation \
     --npz \
-        /work/courses/3dv/team32/training_data_modal/clip-001053.npz \
-        /work/courses/3dv/team32/training_data_modal/clip-001068.npz \
-        /work/courses/3dv/team32/training_data_modal/clip-001083.npz \
-        /work/courses/3dv/team32/training_data_modal/clip-001100.npz \
-        /work/courses/3dv/team32/training_data_modal/clip-001120.npz \
-    --hand_head_path models/NeoVerse/hand_seg_model_opt_run20260426-130617_epoch004.ckpt \
+        demo_data/clip-000088.npz \
+        demo_data/clip-000089.npz \
+        demo_data/clip-000090.npz \
+        demo_data/clip-000091.npz \
+        demo_data/clip-000092.npz \
+    --hand_head_path models/NeoVerse/hand_seg_model_opt_latest.ckpt \
     --output outputs/eval_seg.mp4
